@@ -14,6 +14,8 @@ NODE_CLASS_MAPPINGS = {
     "GrabberTagProcessor": GrabberTagProcessor,
     "ImageResizer": ImageResizer,
     "SaveImageWebsocket": SaveImageWebsocket,
+    "BorderMask": BorderMask,
+    "SaturationAdjuster": SaturationAdjuster,
 }
 
 # Node display name mapping
@@ -30,4 +32,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "GrabberTagProcessor": "Grabber Tag Processor",
     "ImageResizer": "🖼️Image Resizer",
     "SaveImageWebsocket": "Save Image Websocket",
+    "BorderMask": "🎭Border Mask",
+    "SaturationAdjuster": "🌈SaturationAdjuster",
 }
