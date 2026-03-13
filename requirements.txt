@@ -1,0 +1,36 @@
+# ComfyUI-RaNode Requirements
+# ================================
+#
+# IMPORTANT: Do NOT use "pip install -r requirements.txt" directly!
+# This would reinstall torch without CUDA support.
+#
+# Use the install script instead:
+#   Windows: install.bat
+#   Linux/Mac: ./install.sh
+#
+# Or install manually:
+#   pip install numpy pillow requests onnx onnxruntime opencv-python
+#   pip install facenet-pytorch emotiefflib --no-deps
+#
+# For GPU-accelerated ONNX:
+#   pip install onnxruntime-gpu instead of onnxruntime
+#
+# ================================
+
+# Core dependencies
+numpy
+pillow
+requests
+
+# ONNX runtime
+onnxruntime
+
+# ONNX framework
+onnx
+
+# OpenCV
+opencv-python
+
+# Packages requiring --no-deps to avoid torch reinstall:
+# facenet-pytorch
+# emotiefflib
