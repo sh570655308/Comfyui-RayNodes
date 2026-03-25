@@ -8,6 +8,20 @@ import sys
 import subprocess
 import logging
 
+# Fix scipy compatibility issue: simps was renamed to simpson in scipy 1.10+
+# This must be done before importing py-feat
+try:
+    from scipy.integrate import simps
+except ImportError:
+    from scipy.integrate import simpson as simps
+    import scipy.integrate
+    scipy.integrate.simps = simps
+
+# Fix NumPy 2.0 compatibility: np.mat was removed, use np.asmatrix
+import numpy as np
+if not hasattr(np, 'mat'):
+    np.mat = np.asmatrix
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -27,6 +41,7 @@ def ensure_dependencies():
     no_deps_packages = [
         "facenet-pytorch",
         "emotiefflib",
+        "py-feat",
     ]
 
     def is_package_installed(package_name):
@@ -103,6 +118,11 @@ NODE_CLASS_MAPPINGS = {
     "EmotiEffLibAnalysis": EmotiEffLibAnalysisNode,
     "HSEmotionAnalysis": HSEmotionAnalysisNode,
     "MultiEngineEmotion": MultiEngineEmotionNode,
+    # Facial Action Unit Detection
+    "ActionUnitDetection": ActionUnitDetectionNode,
+    "ActionUnitDescription": ActionUnitDescriptionNode,
+    # Pixel Count Scaler
+    "PixelCountScaler": PixelCountScaler,
 }
 
 # Node display name mapping
@@ -132,4 +152,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "EmotiEffLibAnalysis": "😊 EmotiEffLib Analysis (推荐)",
     "HSEmotionAnalysis": "😊 HSEmotion Analysis",
     "MultiEngineEmotion": "😊 Multi-Engine Emotion",
+    # Facial Action Unit Detection
+    "ActionUnitDetection": "😊 Action Unit Detection (面部动作)",
+    "ActionUnitDescription": "😊 Action Unit Description",
+    # Pixel Count Scaler
+    "PixelCountScaler": "🖼️Pixel Count Scaler",
 }

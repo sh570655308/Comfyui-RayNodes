@@ -680,6 +680,70 @@ def pil2tensor(image: Image) -> torch.Tensor:
 def tensor2pil(t_image: torch.Tensor) -> Image:
     return Image.fromarray(np.clip(255.0 * t_image.cpu().numpy().squeeze(), 0, 255).astype(np.uint8))
 
+
+# RTX+lanczos 缩放辅助函数
+def rtx_upscale_image(image_tensor, target_w, target_h, quality="ULTRA"):
+    """
+    使用RTX VSR进行放大，然后用lanczos缩小到目标分辨率
+    如果目标分辨率比原图大，直接用RTX放大
+    如果目标分辨率比原图小，先用RTX放大到2x，然后用lanczos缩小
+    """
+    try:
+        import nvvfx
+    except ImportError:
+        raise ImportError("nvvfx库未安装，无法使用RTX缩放。请安装NVIDIA RTX VSR。")
+
+    orig_h, orig_w = image_tensor.shape[:2]
+
+    # 确定RTX放大的目标尺寸
+    # 如果目标比原图大，直接用RTX放大到目标
+    # 如果目标比原图小，用RTX放大到2x，然后用lanczos缩小
+    if target_w >= orig_w and target_h >= orig_h:
+        # 目标更大，直接用RTX放大
+        rtx_w, rtx_h = target_w, target_h
+    else:
+        # 目标更小，RTX放大2x后用lanczos缩小
+        rtx_w = max(target_w, orig_w * 2)
+        rtx_h = max(target_h, orig_h * 2)
+
+    # 确保是8的倍数（RTX要求）
+    rtx_w = max(8, round(rtx_w / 8) * 8)
+    rtx_h = max(8, round(rtx_h / 8) * 8)
+
+    # 质量映射
+    quality_mapping = {
+        "LOW": nvvfx.effects.QualityLevel.LOW,
+        "MEDIUM": nvvfx.effects.QualityLevel.MEDIUM,
+        "HIGH": nvvfx.effects.QualityLevel.HIGH,
+        "ULTRA": nvvfx.effects.QualityLevel.ULTRA,
+    }
+    selected_quality = quality_mapping.get(quality, nvvfx.effects.QualityLevel.ULTRA)
+
+    # RTX放大
+    with nvvfx.VideoSuperRes(selected_quality) as sr:
+        sr.output_width = rtx_w
+        sr.output_height = rtx_h
+        sr.load()
+
+        # 准备输入 (HWC -> CHW)
+        input_frame = image_tensor.cuda().permute(2, 0, 1).unsqueeze(0).contiguous()
+        dlpack_out = sr.run(input_frame[0]).image
+        rtx_output = torch.from_dlpack(dlpack_out).clone()
+
+        # CHW -> HWC
+        rtx_output = rtx_output.permute(1, 2, 0).cpu()
+
+    # 如果RTX输出尺寸与目标不同，用lanczos调整
+    if rtx_w != target_w or rtx_h != target_h:
+        pil_img = Image.fromarray((rtx_output.numpy() * 255).astype(np.uint8))
+        resized_pil = pil_img.resize((target_w, target_h), Image.LANCZOS)
+        result = torch.from_numpy(np.array(resized_pil).astype(np.float32) / 255.0)
+    else:
+        result = rtx_output
+
+    return result
+
+
 class ImageResizer:
     def __init__(self):
         pass
@@ -690,7 +754,7 @@ class ImageResizer:
             "required": {
                 "image_a": ("IMAGE",),
                 "image_b": ("IMAGE",),
-                "resize_method": (["lanczos", "nearest-exact", "bilinear", "bicubic", "hamming", "box"], {
+                "resize_method": (["rtx+lanczos", "lanczos", "nearest-exact", "bilinear", "bicubic", "hamming", "box"], {
                     "default": "lanczos"
                 }),
             },
@@ -703,7 +767,7 @@ class ImageResizer:
     CATEGORY = 'Image Processing'
 
     def resize_image(self, image_a, image_b, resize_method):
-        # 缩放方式映射
+        # 缩放方式映射（不含rtx+lanczos）
         resize_methods = {
             "nearest-exact": Image.NEAREST,
             "bilinear": Image.BILINEAR,
@@ -712,23 +776,20 @@ class ImageResizer:
             "hamming": Image.HAMMING,
             "box": Image.BOX
         }
-        
-        # 获取选择的缩放方式
-        resize_filter = resize_methods.get(resize_method, Image.LANCZOS)
-        
+
         def process_single_image(i_a, i_b):
-            # Convert tensors to PIL for processing
-            pil_a = tensor2pil(i_a.unsqueeze(0) if i_a.dim() == 3 else i_a).convert('RGB')
-            pil_b = tensor2pil(i_b.unsqueeze(0) if i_b.dim() == 3 else i_b).convert('RGB')
-            
-            # Get target size from image_b
-            target_size = pil_b.size
-            
-            # Resize image_a to the target size using selected algorithm
-            resized_pil_a = pil_a.resize(target_size, resize_filter)
-            
-            # Convert resized PIL image back to tensor
-            return pil2tensor(resized_pil_a)
+            # 获取目标尺寸
+            target_h, target_w = i_b.shape[:2]
+
+            if resize_method == "rtx+lanczos":
+                # 使用RTX+lanczos
+                return rtx_upscale_image(i_a, target_w, target_h, "ULTRA").unsqueeze(0)
+            else:
+                # 使用传统PIL方法
+                resize_filter = resize_methods.get(resize_method, Image.LANCZOS)
+                pil_a = tensor2pil(i_a.unsqueeze(0) if i_a.dim() == 3 else i_a).convert('RGB')
+                resized_pil_a = pil_a.resize((target_w, target_h), resize_filter)
+                return pil2tensor(resized_pil_a)
 
         # Handle different input types
         if isinstance(image_a, list) and isinstance(image_b, list):
@@ -746,7 +807,7 @@ class ImageResizer:
                 raise ValueError("Incompatible tensor dimensions")
         else:
             raise ValueError("Incompatible input types")
-        
+
         return (torch.cat(ret_images, dim=0),)
 
 NODE_CLASS_MAPPINGS.update({
@@ -2389,5 +2450,526 @@ NODE_DISPLAY_NAME_MAPPINGS.update({
     "EmotiEffLibAnalysis": "😊 EmotiEffLib Analysis",
     "HSEmotionAnalysis": "😊 HSEmotion Analysis",
     "MultiEngineEmotion": "😊 Multi-Engine Emotion",
+})
+
+
+# ==============================================================================
+# Facial Action Unit Detection Node (py-feat)
+# ==============================================================================
+
+# Fix scipy compatibility issue: simps was renamed to simpson in scipy 1.10+
+try:
+    from scipy.integrate import simps
+except ImportError:
+    from scipy.integrate import simpson as simps
+    import scipy.integrate
+    scipy.integrate.simps = simps
+
+# Action Unit names and descriptions
+AU_DESCRIPTIONS = {
+    "AU1": {"name": "Inner Brow Raiser", "cn": "内侧眉毛上扬", "muscle": "Frontalis (medial)"},
+    "AU2": {"name": "Outer Brow Raiser", "cn": "外侧眉毛上扬", "muscle": "Frontalis (lateral)"},
+    "AU4": {"name": "Brow Lowerer", "cn": "蹙眉", "muscle": "Corrugator Supercilii"},
+    "AU5": {"name": "Upper Lid Raiser", "cn": "上眼睑上扬", "muscle": "Levator Palpebrae"},
+    "AU6": {"name": "Cheek Raiser", "cn": "脸颊上扬", "muscle": "Orbicularis Oculi"},
+    "AU7": {"name": "Lid Tightener", "cn": "眼睑紧绷", "muscle": "Orbicularis Oculi"},
+    "AU9": {"name": "Nose Wrinkler", "cn": "皱鼻", "muscle": "Levator Labii Superioris"},
+    "AU10": {"name": "Upper Lip Raiser", "cn": "上唇上扬", "muscle": "Levator Labii Superioris"},
+    "AU11": {"name": "Nasolabial Deepener", "cn": "鼻唇沟加深", "muscle": "Zygomaticus Minor"},
+    "AU12": {"name": "Lip Corner Puller", "cn": "嘴角上扬", "muscle": "Zygomaticus Major"},
+    "AU14": {"name": "Dimpler", "cn": "酒窝", "muscle": "Buccinator"},
+    "AU15": {"name": "Lip Corner Depressor", "cn": "嘴角下垂", "muscle": "Depressor Anguli Oris"},
+    "AU17": {"name": "Chin Raiser", "cn": "下巴上扬", "muscle": "Mentalis"},
+    "AU20": {"name": "Lip Stretcher", "cn": "嘴唇拉伸", "muscle": "Risorius"},
+    "AU23": {"name": "Lip Tightener", "cn": "嘴唇紧闭", "muscle": "Orbicularis Oris"},
+    "AU24": {"name": "Lip Pressor", "cn": "嘴唇抿紧", "muscle": "Orbicularis Oris"},
+    "AU25": {"name": "Lips Part", "cn": "嘴唇张开", "muscle": "Depressor Labii"},
+    "AU26": {"name": "Jaw Drop", "cn": "下巴下垂", "muscle": "Masseter"},
+    "AU28": {"name": "Lip Suck", "cn": "嘴唇吸吮", "muscle": "Orbicularis Oris"},
+    "AU43": {"name": "Eyes Closed", "cn": "闭眼", "muscle": "Relaxation"},
+}
+
+
+class ActionUnitDetectionNode:
+    """
+    Facial Action Unit (AU) Detection using py-feat with EmotiEffLib face detector.
+    Detects specific facial muscle movements like "furrowed brows", "smiling", etc.
+    Works better with anime/illustration faces than default py-feat.
+    """
+
+    def __init__(self):
+        self.au_detector = None
+        self.face_detector = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+            },
+            "optional": {
+                "au_model": (["xgb", "svm"], {"default": "xgb"}),
+                "threshold": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "output_format": (["description", "tags", "json"], {"default": "description"}),
+                "language": (["english", "chinese"], {"default": "english"}),
+                "include_landmarks": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "DICT", "IMAGE")
+    RETURN_NAMES = ("au_text", "au_data", "visualization")
+    FUNCTION = "detect_action_units"
+    CATEGORY = "Face Analysis"
+    OUTPUT_NODE = True
+
+    def _init_face_detector(self, device):
+        """Initialize MTCNN face detector from facenet-pytorch"""
+        if self.face_detector is None:
+            from facenet_pytorch import MTCNN
+            self.face_detector = MTCNN(keep_all=True, post_process=False, min_face_size=20, device=device)
+        return self.face_detector
+
+    def _init_au_detector(self, au_model):
+        """Initialize py-feat AU detector"""
+        if self.au_detector is None:
+            from feat import Detector
+            # py-feat requires all models to be specified, cannot disable individual detections
+            self.au_detector = Detector(
+                au_model=au_model,
+                face_model='retinaface',
+            )
+        return self.au_detector
+
+    def detect_action_units(
+        self,
+        image: torch.Tensor,
+        au_model: str = "xgb",
+        threshold: float = 0.5,
+        output_format: str = "description",
+        language: str = "english",
+        include_landmarks: bool = False,
+    ):
+        """Detect facial action units using MTCNN for face detection and py-feat for AU analysis"""
+        import tempfile
+        import os
+        import torch as torch_module
+
+        # Handle batch dimension
+        if len(image.shape) == 4:
+            image_np = image[0].cpu().numpy()
+        else:
+            image_np = image.cpu().numpy()
+
+        # Convert from RGB (0-1) to uint8
+        image_np = (image_np * 255).astype(np.uint8)
+
+        # Determine device
+        device = "cuda" if torch_module.cuda.is_available() else "cpu"
+
+        temp_file = None
+        try:
+            # Step 1: Use MTCNN to detect faces (better for anime)
+            face_detector = self._init_face_detector(device)
+            detect_result = face_detector.detect(image_np, landmarks=True)
+            # MTCNN returns (boxes, probs, landmarks) when landmarks=True
+            if len(detect_result) == 3:
+                bounding_boxes, probs, landmarks = detect_result
+            else:
+                bounding_boxes, probs = detect_result
+                landmarks = None
+
+            if bounding_boxes is None or len(bounding_boxes) == 0:
+                return "No faces detected", {"faces": [], "error": "No faces detected"}, image
+
+            # Filter by confidence
+            if probs is not None:
+                valid_indices = probs > 0.7
+                bounding_boxes = bounding_boxes[valid_indices]
+
+            if len(bounding_boxes) == 0:
+                return "No faces detected (low confidence)", {"faces": [], "error": "No faces detected"}, image
+
+            # Step 2: Save image and use py-feat for AU detection
+            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
+            temp_file = temp_path
+            os.close(temp_fd)
+
+            pil_img = Image.fromarray(image_np)
+            pil_img.save(temp_path)
+
+            au_detector = self._init_au_detector(au_model)
+            result = au_detector.detect_image(temp_path)
+
+            # Check if AU detection worked
+            if result.aus is None or len(result.aus) == 0:
+                return "AU detection failed", {"faces": [], "error": "AU detection failed"}, image
+
+            au_texts = []
+            all_au_data = []
+            visualization = image_np.copy()
+
+            # Get AU columns
+            au_columns = [col for col in result.aus.columns if col.startswith('AU')]
+            num_faces = min(len(bounding_boxes), len(result.aus))
+
+            h, w = image_np.shape[:2]
+
+            for face_idx in range(num_faces):
+                # Get bounding box from MTCNN
+                bbox = bounding_boxes[face_idx]
+                box = bbox.astype(int)
+                x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+
+                # Get AU data
+                face_row = result.aus.iloc[face_idx]
+
+                # Collect detected AUs above threshold
+                detected_aus = []
+                au_scores = {}
+
+                for au_col in au_columns:
+                    au_num = au_col.replace('AU', '')
+                    au_name = f"AU{int(au_num)}"
+                    score = float(face_row[au_col])
+                    au_scores[au_name] = score
+
+                    if score >= threshold:
+                        detected_aus.append({
+                            "au": au_name,
+                            "score": score,
+                            "description": AU_DESCRIPTIONS.get(au_name, {"name": au_name, "cn": au_name})
+                        })
+
+                # Sort by score
+                detected_aus.sort(key=lambda x: x["score"], reverse=True)
+
+                # Build output text - simplified format
+                if output_format == "tags":
+                    if language == "chinese":
+                        tags = [AU_DESCRIPTIONS.get(au["au"], {"cn": au["au"]})["cn"] for au in detected_aus]
+                    else:
+                        tags = [AU_DESCRIPTIONS.get(au["au"], {"name": au["au"]})["name"] for au in detected_aus]
+                    text = ", ".join(tags)
+                elif output_format == "json":
+                    import json
+                    text = json.dumps({
+                        "face_id": face_idx + 1,
+                        "detected_aus": [{"au": au["au"], "score": round(au["score"], 3)} for au in detected_aus]
+                    }, indent=2)
+                else:
+                    # Description format - simple, no AU numbers or confidence
+                    lines = [f"Face {face_idx + 1}:"]
+                    for au in detected_aus:
+                        desc = AU_DESCRIPTIONS.get(au["au"], {"name": au["au"], "cn": au["au"]})
+                        if language == "chinese":
+                            lines.append(f"  - {desc['cn']}")
+                        else:
+                            lines.append(f"  - {desc['name']}")
+                    text = "\n".join(lines)
+
+                au_texts.append(text)
+
+                # Store data
+                face_data = {
+                    "face_id": face_idx + 1,
+                    "detected_aus": [{"au": au["au"], "score": round(au["score"], 3)} for au in detected_aus],
+                    "all_au_scores": {k: round(v, 3) for k, v in au_scores.items()},
+                }
+
+                all_au_data.append(face_data)
+
+                # Draw on visualization
+                if x2 > x1 and y2 > y1:
+                    cv2.rectangle(visualization, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                    if detected_aus:
+                        top_au = detected_aus[0]
+                        desc = AU_DESCRIPTIONS.get(top_au["au"], {"name": top_au["au"], "cn": top_au["au"]})
+                        label = desc["cn"] if language == "chinese" else desc["name"]
+                        cv2.putText(visualization, label, (x1, y1-10),
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            visualization_tensor = torch.from_numpy(visualization.astype(np.float32) / 255.0)
+
+            return "\n\n".join(au_texts), {"faces": all_au_data, "model": au_model, "threshold": threshold}, visualization_tensor
+
+        except ImportError as e:
+            return f"Error: Missing dependency - {str(e)}", {"error": str(e)}, image
+        except Exception as e:
+            import traceback
+            return f"Error: {str(e)}\n{traceback.format_exc()}", {"error": str(e)}, image
+        finally:
+            if temp_file and os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+
+
+class ActionUnitDescriptionNode:
+    """
+    Generate natural language descriptions from Action Units.
+    Converts detected AUs into readable facial expression descriptions.
+    """
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "au_data": ("DICT",),
+            },
+            "optional": {
+                "language": (["english", "chinese"], {"default": "english"}),
+                "detail_level": (["simple", "detailed", "comprehensive"], {"default": "detailed"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("description",)
+    FUNCTION = "generate_description"
+    CATEGORY = "Face Analysis"
+
+    def generate_description(self, au_data: dict, language: str = "english", detail_level: str = "detailed"):
+        """Generate natural language description from AU data"""
+        if "error" in au_data:
+            return (f"Error: {au_data['error']}",)
+
+        faces = au_data.get("faces", [])
+        if not faces:
+            return ("No action unit data available",)
+
+        descriptions = []
+
+        # AU to expression mappings
+        au_expressions_en = {
+            "AU1": "raised inner eyebrows",
+            "AU2": "raised outer eyebrows",
+            "AU4": "furrowed brows",
+            "AU5": "widened eyes",
+            "AU6": "raised cheeks (smiling eyes)",
+            "AU7": "tightened eyelids",
+            "AU9": "wrinkled nose",
+            "AU10": "raised upper lip",
+            "AU11": "deepened nasolabial folds",
+            "AU12": "smiling (mouth corners pulled up)",
+            "AU13": "puffed cheeks",
+            "AU14": "dimpling",
+            "AU15": "mouth corners turned down",
+            "AU17": "raised chin",
+            "AU18": "puckered lips",
+            "AU19": "tongue visible",
+            "AU20": "stretched lips",
+            "AU22": "funneled lips",
+            "AU23": "tightened lips",
+            "AU24": "pressed lips",
+            "AU25": "parted lips",
+            "AU26": "dropped jaw",
+            "AU27": "mouth stretched open",
+            "AU28": "sucked lip",
+            "AU43": "closed eyes",
+            "AU45": "blinking",
+        }
+
+        au_expressions_cn = {
+            "AU1": "内侧眉毛上扬",
+            "AU2": "外侧眉毛上扬",
+            "AU4": "蹙眉",
+            "AU5": "眼睛睁大",
+            "AU6": "脸颊上扬（笑眼）",
+            "AU7": "眼睑紧绷",
+            "AU9": "皱鼻",
+            "AU10": "上唇上扬",
+            "AU11": "鼻唇沟加深",
+            "AU12": "微笑（嘴角上扬）",
+            "AU13": "脸颊鼓起",
+            "AU14": "酒窝",
+            "AU15": "嘴角下垂",
+            "AU17": "下巴上扬",
+            "AU18": "嘴唇嘟起",
+            "AU19": "舌头露出",
+            "AU20": "嘴唇拉伸",
+            "AU22": "嘴唇嘟成圆形",
+            "AU23": "嘴唇紧绷",
+            "AU24": "嘴唇抿紧",
+            "AU25": "嘴唇微张",
+            "AU26": "下巴下垂（张嘴）",
+            "AU27": "嘴巴张大",
+            "AU28": "嘴唇吸吮",
+            "AU43": "闭眼",
+            "AU45": "眨眼",
+        }
+
+        au_expr = au_expressions_cn if language == "chinese" else au_expressions_en
+
+        for face in faces:
+            face_id = face.get("face_id", 1)
+            detected_aus = face.get("detected_aus", [])
+
+            if not detected_aus:
+                if language == "chinese":
+                    descriptions.append(f"人脸 {face_id}: 未检测到明显的面部动作")
+                else:
+                    descriptions.append(f"Face {face_id}: No significant facial actions detected")
+                continue
+
+            if detail_level == "simple":
+                # Just list the top 3 actions
+                top_aus = detected_aus[:3]
+                actions = [au_expr.get(au["au"], au["au"]) for au in top_aus]
+                if language == "chinese":
+                    desc = f"人脸 {face_id}: " + "、".join(actions)
+                else:
+                    desc = f"Face {face_id}: " + ", ".join(actions)
+
+            elif detail_level == "detailed":
+                # List actions only (no confidence)
+                lines = [f"Face {face_id}:" if language == "english" else f"人脸 {face_id}:"]
+                for au in detected_aus[:5]:  # Top 5
+                    action = au_expr.get(au["au"], au["au"])
+                    lines.append(f"  - {action}")
+                desc = "\n".join(lines)
+
+            else:  # comprehensive
+                # Full description with all actions (no AU names or confidence)
+                lines = [f"Face {face_id} - Facial Actions:" if language == "english" else f"人脸 {face_id} - 面部动作:"]
+                lines.append("")
+                for au in detected_aus:
+                    action = au_expr.get(au["au"], au["au"])
+                    lines.append(f"• {action}")
+                desc = "\n".join(lines)
+
+            descriptions.append(desc)
+
+        return ("\n\n".join(descriptions),)
+
+
+NODE_CLASS_MAPPINGS.update({
+    "ActionUnitDetection": ActionUnitDetectionNode,
+    "ActionUnitDescription": ActionUnitDescriptionNode,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "ActionUnitDetection": "😊 Action Unit Detection (FACS)",
+    "ActionUnitDescription": "😊 Action Unit Description",
+})
+
+
+# 增加新节点：PixelCountScaler - 根据像素总数缩放图像，并支持倍率限制
+class PixelCountScaler:
+    """
+    根据目标像素总数缩放图像，并将边长调整为指定倍数。
+    像素总数使用二进制概念（如1M = 1024*1024 = 1,048,576）
+    """
+
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "target_megapixels": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.001,
+                    "max": 1000.0,
+                    "step": 0.001,
+                    "display": "number"
+                }),
+                "divisor": ("INT", {
+                    "default": 8,
+                    "min": 1,
+                    "max": 128,
+                    "step": 1
+                }),
+                "resize_method": (["rtx+lanczos", "lanczos", "nearest-exact", "bilinear", "bicubic", "hamming", "box"], {
+                    "default": "lanczos"
+                }),
+            },
+            "optional": {}
+        }
+
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("resized_image", "new_width", "new_height")
+    FUNCTION = 'scale_by_pixel_count'
+    CATEGORY = 'Image Processing'
+
+    def scale_by_pixel_count(self, image, target_megapixels, divisor, resize_method):
+        # 计算实际目标像素数（1M = 1024×1024 = 1,048,576）
+        total_target_pixels = int(target_megapixels * 1024 * 1024)
+
+        # 确保目标像素数至少为1
+        total_target_pixels = max(1, total_target_pixels)
+
+        # 缩放方式映射（不含rtx+lanczos）
+        resize_methods = {
+            "nearest-exact": Image.NEAREST,
+            "bilinear": Image.BILINEAR,
+            "lanczos": Image.LANCZOS,
+            "bicubic": Image.BICUBIC,
+            "hamming": Image.HAMMING,
+            "box": Image.BOX
+        }
+
+        def process_single_image(img_tensor):
+            # 获取原始图像尺寸
+            orig_h, orig_w = img_tensor.shape[:2]
+            orig_pixels = orig_w * orig_h
+
+            if orig_pixels == 0:
+                return img_tensor, orig_w, orig_h
+
+            # 计算缩放比例
+            scale = (total_target_pixels / orig_pixels) ** 0.5
+
+            # 计算初步缩放后的尺寸
+            new_w = orig_w * scale
+            new_h = orig_h * scale
+
+            # 将边长调整为最接近的divisor的倍数
+            def round_to_divisor(value, d):
+                """将值调整为最接近的d的倍数"""
+                return max(d, round(value / d) * d)
+
+            final_w = round_to_divisor(new_w, divisor)
+            final_h = round_to_divisor(new_h, divisor)
+
+            # 根据缩放方法处理
+            if resize_method == "rtx+lanczos":
+                # 使用RTX+lanczos
+                resized_tensor = rtx_upscale_image(img_tensor, final_w, final_h, "ULTRA")
+            else:
+                # 使用传统PIL方法
+                resize_filter = resize_methods.get(resize_method, Image.LANCZOS)
+                pil_img = Image.fromarray((img_tensor.cpu().numpy() * 255).astype(np.uint8))
+                resized_pil = pil_img.resize((final_w, final_h), resize_filter)
+                resized_tensor = torch.from_numpy(np.array(resized_pil).astype(np.float32) / 255.0)
+
+            return resized_tensor, final_w, final_h
+
+        # 处理批量图像
+        if image.dim() == 4:
+            # 批量处理
+            results = [process_single_image(img) for img in image]
+            resized_images = torch.stack([r[0] for r in results])
+            final_w = results[0][1]
+            final_h = results[0][2]
+        else:
+            # 单张图像
+            resized_images, final_w, final_h = process_single_image(image)
+            resized_images = resized_images.unsqueeze(0)
+
+        return (resized_images, final_w, final_h)
+
+
+NODE_CLASS_MAPPINGS.update({
+    "PixelCountScaler": PixelCountScaler,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "PixelCountScaler": "🖼️Pixel Count Scaler"
 })
 
