@@ -2973,3 +2973,60 @@ NODE_DISPLAY_NAME_MAPPINGS.update({
     "PixelCountScaler": "🖼️Pixel Count Scaler"
 })
 
+
+# Keyword Filter Node - 从输入文本中提取匹配的关键词
+class KeywordFilter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "multiline": True}),
+                "keywords": ("STRING", {"default": "", "multiline": True, "placeholder": "每行一个关键词"}),
+                "case_sensitive": ("BOOLEAN", {"default": False}),
+                "separator": ("STRING", {"default": ", "}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("matched_keywords", "matched_text")
+    FUNCTION = "filter_keywords"
+    CATEGORY = "text"
+
+    def filter_keywords(self, text: str, keywords: str, case_sensitive: bool, separator: str) -> tuple:
+        # 解析关键词列表，每行一个
+        keyword_list = [kw.strip() for kw in keywords.split('\n') if kw.strip()]
+
+        if not keyword_list:
+            return ("", "")
+
+        search_text = text if case_sensitive else text.lower()
+        matched = []
+        matched_original = []
+
+        for kw in keyword_list:
+            kw_search = kw if case_sensitive else kw.lower()
+            if kw_search in search_text:
+                if kw not in matched:
+                    matched.append(kw)
+                    # 从原始文本中提取匹配的片段
+                    if case_sensitive:
+                        idx = text.find(kw)
+                    else:
+                        idx = text.lower().find(kw.lower())
+                    if idx != -1:
+                        matched_original.append(text[idx:idx + len(kw)])
+
+        matched_keywords = separator.join(matched)
+        matched_text = separator.join(matched_original)
+
+        return (matched_keywords, matched_text)
+
+
+NODE_CLASS_MAPPINGS.update({
+    "KeywordFilter": KeywordFilter,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "KeywordFilter": "🏷️ Keyword Filter"
+})
+

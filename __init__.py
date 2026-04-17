@@ -123,6 +123,8 @@ NODE_CLASS_MAPPINGS = {
     "ActionUnitDescription": ActionUnitDescriptionNode,
     # Pixel Count Scaler
     "PixelCountScaler": PixelCountScaler,
+    # Keyword Filter
+    "KeywordFilter": KeywordFilter,
 }
 
 # Node display name mapping
@@ -157,4 +159,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ActionUnitDescription": "😊 Action Unit Description",
     # Pixel Count Scaler
     "PixelCountScaler": "🖼️Pixel Count Scaler",
+    # Keyword Filter
+    "KeywordFilter": "🏷️ Keyword Filter",
 }
