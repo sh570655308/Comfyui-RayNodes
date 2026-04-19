@@ -125,6 +125,8 @@ NODE_CLASS_MAPPINGS = {
     "PixelCountScaler": PixelCountScaler,
     # Keyword Filter
     "KeywordFilter": KeywordFilter,
+    # Keyword Filter + LoRA
+    "KeywordFilterLoRA": KeywordFilterLoRA,
 }
 
 # Node display name mapping
@@ -161,4 +163,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "PixelCountScaler": "🖼️Pixel Count Scaler",
     # Keyword Filter
     "KeywordFilter": "🏷️ Keyword Filter",
+    # Keyword Filter + LoRA
+    "KeywordFilterLoRA": "🏷️ Keyword Filter + LoRA",
 }

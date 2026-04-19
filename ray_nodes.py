@@ -10,6 +10,8 @@ import os
 import re
 import time
 import comfy.utils
+import comfy.sd
+import folder_paths
 
 
 # From bracketed-tag-merger.py
@@ -3028,5 +3030,75 @@ NODE_CLASS_MAPPINGS.update({
 
 NODE_DISPLAY_NAME_MAPPINGS.update({
     "KeywordFilter": "🏷️ Keyword Filter"
+})
+
+
+# Keyword Filter + LoRA 条件加载节点
+class KeywordFilterLoRA:
+    def __init__(self):
+        self.loaded_lora = None
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "multiline": True}),
+                "keywords": ("STRING", {"default": "", "multiline": True, "placeholder": "每行一个关键词"}),
+                "case_sensitive": ("BOOLEAN", {"default": False}),
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength_model": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+                "strength_clip": ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("matched_keywords", "MODEL", "CLIP", "status")
+    FUNCTION = "filter_and_load_lora"
+    CATEGORY = "text"
+
+    def filter_and_load_lora(self, text, keywords, case_sensitive, model, clip, lora_name, strength_model, strength_clip):
+        # 解析关键词
+        keyword_list = [kw.strip() for kw in keywords.split('\n') if kw.strip()]
+
+        # 匹配关键词
+        search_text = text if case_sensitive else text.lower()
+        matched = []
+        for kw in keyword_list:
+            kw_search = kw if case_sensitive else kw.lower()
+            if kw_search in search_text and kw not in matched:
+                matched.append(kw)
+
+        matched_keywords = ", ".join(matched)
+
+        # 无匹配，透传原始 MODEL/CLIP
+        if not matched:
+            return (matched_keywords, model, clip, "No match, LoRA not loaded")
+
+        # 有关键词匹配，加载 LoRA
+        lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
+        lora = None
+        if self.loaded_lora is not None:
+            if self.loaded_lora[0] == lora_path:
+                lora = self.loaded_lora[1]
+            else:
+                self.loaded_lora = None
+
+        if lora is None:
+            lora = comfy.utils.load_torch_file(lora_path, safe_load=True)
+            self.loaded_lora = (lora_path, lora)
+
+        model_lora, clip_lora = comfy.sd.load_lora_for_models(model, clip, lora, strength_model, strength_clip)
+        status = f"LoRA loaded: {lora_name} (model={strength_model}, clip={strength_clip})"
+        return (matched_keywords, model_lora, clip_lora, status)
+
+
+NODE_CLASS_MAPPINGS.update({
+    "KeywordFilterLoRA": KeywordFilterLoRA,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "KeywordFilterLoRA": "🏷️ Keyword Filter + LoRA"
 })
 
