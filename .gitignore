@@ -175,6 +175,9 @@ cython_debug/
 # Secrets / personal configs (contain real API keys)
 prompt_enhance_endpoints.json
 
+# Local data files (tag rank lists, etc.)
+danbooru_*.txt
+
 # Local agent / editor config
 .claude/
 
