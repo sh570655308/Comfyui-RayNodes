@@ -169,3 +169,18 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# ---- Project-specific ----
+
+# Secrets / personal configs (contain real API keys)
+prompt_enhance_endpoints.json
+
+# Local agent / editor config
+.claude/
+
+# Debug / scratch test scripts
+test_*.py
+
+# Tracked model artifacts are downloaded at runtime into models/manga_text/;
+# keep the directory via .gitkeep but never commit the weights themselves.
+models/manga_text/comic-text-detector.onnx

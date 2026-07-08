@@ -1,0 +1,16 @@
+{
+  "Example-Endpoint": {
+    "url": "https://api.example.com/v1",
+    "api_key": "your-api-key-here",
+    "model_id": "your-model-id",
+    "status": "",
+    "last_tested": ""
+  },
+  "OpenAI-Compatible": {
+    "url": "https://api.openai.com/v1",
+    "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "model_id": "gpt-4o-mini",
+    "status": "",
+    "last_tested": ""
+  }
+}

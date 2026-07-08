@@ -1,0 +1,3 @@
+# Model weights for MangaTextRemoval are downloaded here at first run:
+#   comic-text-detector.onnx  (comic-text-detector by dmMaze, GPL-3.0)
+# LaMa weights are managed by simple-lama-inpainting (its own cache dir).

@@ -35,13 +35,20 @@ def ensure_dependencies():
         "onnx",
         "onnxruntime",
         "opencv-python",
+        # Manga text removal: model downloader (LaMa weights via simple-lama)
+        "huggingface-hub",
     ]
 
-    # Packages that need --no-deps to avoid torch reinstall
+    # Packages that need --no-deps to avoid torch reinstall or pinned-dep conflicts
     no_deps_packages = [
         "facenet-pytorch",
         "emotiefflib",
         "py-feat",
+        # simple-lama-inpainting pins numpy<2.0.0 which breaks on Python 3.13
+        # (forces source build of old numpy). Install without deps; its real
+        # runtime needs (torch/pillow/numpy/huggingface-hub/fire) are already
+        # present in the ComfyUI environment.
+        "simple-lama-inpainting",
     ]
 
     def is_package_installed(package_name):
@@ -90,6 +97,7 @@ def ensure_dependencies():
 ensure_dependencies()
 
 from .ray_nodes import *
+from .manga_text_removal import MangaTextRemoval
 
 # Node class mapping
 NODE_CLASS_MAPPINGS = {
@@ -127,6 +135,23 @@ NODE_CLASS_MAPPINGS = {
     "KeywordFilter": KeywordFilter,
     # Keyword Filter + LoRA
     "KeywordFilterLoRA": KeywordFilterLoRA,
+    # Outpainting
+    "OutpaintingPreprocess": OutpaintingPreprocess,
+    "OutpaintingRemove": OutpaintingRemove,
+    # Keyword Reverse Filter
+    "KeywordReverseFilter": KeywordReverseFilter,
+    # Dark Region Overlay
+    "DarkRegionOverlay": DarkRegionOverlay,
+    # Danbooru Tag Fetcher
+    "DanbooruFetcher": DanbooruFetcher,
+    # Text File Line Reader
+    "TextFileLineReader": TextFileLineReader,
+    # Manga Text Removal (detect + balloon + erase)
+    "MangaTextRemoval": MangaTextRemoval,
+    # Prompt Enhance (OpenAI-compatible)
+    "PromptEnhanceSettings": PromptEnhanceSettings,
+    "PromptEnhancer": PromptEnhancer,
+    "ImageAnalyzer": ImageAnalyzer,
 }
 
 # Node display name mapping
@@ -165,4 +190,21 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KeywordFilter": "🏷️ Keyword Filter",
     # Keyword Filter + LoRA
     "KeywordFilterLoRA": "🏷️ Keyword Filter + LoRA",
+    # Outpainting
+    "OutpaintingPreprocess": "🖼️ Outpainting Preprocess",
+    "OutpaintingRemove": "🖼️ Outpainting Remove",
+    # Keyword Reverse Filter
+    "KeywordReverseFilter": "🏷️ Keyword Reverse Filter",
+    # Dark Region Overlay
+    "DarkRegionOverlay": "🖼️ Dark Region Overlay",
+    # Danbooru Tag Fetcher
+    "DanbooruFetcher": "🏷️ Danbooru Fetcher",
+    # Text File Line Reader
+    "TextFileLineReader": "📄 Text File Line Reader",
+    # Manga Text Removal
+    "MangaTextRemoval": "🖼️ Manga Text Removal (漫画文字擦除)",
+    # Prompt Enhance (OpenAI-compatible)
+    "PromptEnhanceSettings": "🤖 提示词扩写设置 (Prompt Enhance Settings)",
+    "PromptEnhancer": "🤖 提示词扩写 (Prompt Enhancer)",
+    "ImageAnalyzer": "🖼️ 图片分析 (Image Analyzer)",
 }

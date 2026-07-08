@@ -2,6 +2,7 @@
 # Auto-generated file
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Tuple  # 添加这行
 from PIL import Image
@@ -9,6 +10,7 @@ import cv2
 import os
 import re
 import time
+import json
 import comfy.utils
 import comfy.sd
 import folder_paths
@@ -2864,6 +2866,7 @@ class PixelCountScaler:
     """
     根据目标像素总数缩放图像，并将边长调整为指定倍数。
     像素总数使用二进制概念（如1M = 1024*1024 = 1,048,576）
+    支持GPU批量加速和进度显示。
     """
 
     def __init__(self):
@@ -2899,15 +2902,21 @@ class PixelCountScaler:
     FUNCTION = 'scale_by_pixel_count'
     CATEGORY = 'Image Processing'
 
+    # torch支持的resize模式映射
+    TORCH_RESIZE_MODES = {
+        "nearest-exact": "nearest-exact",
+        "bilinear": "bilinear",
+        "bicubic": "bicubic",
+        "box": "area",
+    }
+
     def scale_by_pixel_count(self, image, target_megapixels, divisor, resize_method):
         # 计算实际目标像素数（1M = 1024×1024 = 1,048,576）
         total_target_pixels = int(target_megapixels * 1024 * 1024)
-
-        # 确保目标像素数至少为1
         total_target_pixels = max(1, total_target_pixels)
 
-        # 缩放方式映射（不含rtx+lanczos）
-        resize_methods = {
+        # PIL缩放方式映射
+        pil_resize_methods = {
             "nearest-exact": Image.NEAREST,
             "bilinear": Image.BILINEAR,
             "lanczos": Image.LANCZOS,
@@ -2916,55 +2925,121 @@ class PixelCountScaler:
             "box": Image.BOX
         }
 
-        def process_single_image(img_tensor):
-            # 获取原始图像尺寸
-            orig_h, orig_w = img_tensor.shape[:2]
-            orig_pixels = orig_w * orig_h
+        # 计算目标尺寸（基于第一张图的比例）
+        orig_h, orig_w = image.shape[1], image.shape[2]
+        orig_pixels = orig_w * orig_h
+        scale = (total_target_pixels / max(1, orig_pixels)) ** 0.5
 
-            if orig_pixels == 0:
-                return img_tensor, orig_w, orig_h
+        def round_to_divisor(value, d):
+            return max(d, round(value / d) * d)
 
-            # 计算缩放比例
-            scale = (total_target_pixels / orig_pixels) ** 0.5
+        final_w = round_to_divisor(orig_w * scale, divisor)
+        final_h = round_to_divisor(orig_h * scale, divisor)
 
-            # 计算初步缩放后的尺寸
-            new_w = orig_w * scale
-            new_h = orig_h * scale
+        # 单张图像：增加batch维度统一处理
+        if image.dim() == 3:
+            image = image.unsqueeze(0)
 
-            # 将边长调整为最接近的divisor的倍数
-            def round_to_divisor(value, d):
-                """将值调整为最接近的d的倍数"""
-                return max(d, round(value / d) * d)
+        batch_size = image.shape[0]
 
-            final_w = round_to_divisor(new_w, divisor)
-            final_h = round_to_divisor(new_h, divisor)
-
-            # 根据缩放方法处理
-            if resize_method == "rtx+lanczos":
-                # 使用RTX+lanczos
-                resized_tensor = rtx_upscale_image(img_tensor, final_w, final_h, "ULTRA")
-            else:
-                # 使用传统PIL方法
-                resize_filter = resize_methods.get(resize_method, Image.LANCZOS)
-                pil_img = Image.fromarray((img_tensor.cpu().numpy() * 255).astype(np.uint8))
-                resized_pil = pil_img.resize((final_w, final_h), resize_filter)
-                resized_tensor = torch.from_numpy(np.array(resized_pil).astype(np.float32) / 255.0)
-
-            return resized_tensor, final_w, final_h
-
-        # 处理批量图像
-        if image.dim() == 4:
-            # 批量处理
-            results = [process_single_image(img) for img in image]
-            resized_images = torch.stack([r[0] for r in results])
-            final_w = results[0][1]
-            final_h = results[0][2]
+        if resize_method == "rtx+lanczos":
+            resized_images = self._resize_rtx_batch(image, final_w, final_h, batch_size)
+        elif resize_method in self.TORCH_RESIZE_MODES:
+            # GPU批量resize（nearest-exact, bilinear, bicubic, box）
+            resized_images = self._resize_torch_batch(image, final_w, final_h, resize_method)
         else:
-            # 单张图像
-            resized_images, final_w, final_h = process_single_image(image)
-            resized_images = resized_images.unsqueeze(0)
+            # PIL逐张处理（lanczos, hamming）带进度条
+            resized_images = self._resize_pil_batch(image, final_w, final_h, pil_resize_methods[resize_method], batch_size)
 
         return (resized_images, final_w, final_h)
+
+    def _resize_torch_batch(self, image, target_w, target_h, resize_method):
+        """使用torch.nn.functional.interpolate在GPU上批量resize"""
+        mode = self.TORCH_RESIZE_MODES[resize_method]
+        # BHWC -> BCHW, 移到GPU
+        tensor = image.permute(0, 3, 1, 2).cuda()
+        # 批量resize
+        resized = F.interpolate(tensor, size=(target_h, target_w), mode=mode)
+        # BCHW -> BHWC, 回CPU
+        return resized.permute(0, 2, 3, 1).cpu().clamp(0.0, 1.0)
+
+    def _resize_pil_batch(self, image, target_w, target_h, pil_filter, batch_size):
+        """使用PIL逐张resize，带进度条"""
+        pbar = comfy.utils.ProgressBar(batch_size)
+        results = []
+        for i in range(batch_size):
+            img_tensor = image[i]
+            pil_img = Image.fromarray((img_tensor.cpu().numpy() * 255).astype(np.uint8))
+            resized_pil = pil_img.resize((target_w, target_h), pil_filter)
+            resized_tensor = torch.from_numpy(np.array(resized_pil).astype(np.float32) / 255.0)
+            results.append(resized_tensor)
+            pbar.update_absolute(i + 1, batch_size)
+        return torch.stack(results)
+
+    def _resize_rtx_batch(self, image, target_w, target_h, batch_size):
+        """RTX+lanczos批量处理，自适应分批，带进度条"""
+        try:
+            import nvvfx
+        except ImportError:
+            raise ImportError("nvvfx库未安装，无法使用RTX缩放。请安装NVIDIA RTX VSR。")
+
+        # 自适应分批：参照Nvidia RTX Nodes，限制每批输出不超过16MP
+        MAX_PIXELS = 1024 * 1024 * 16
+        out_pixels = target_w * target_h
+        chunk_size = max(1, MAX_PIXELS // max(1, out_pixels))
+
+        pbar = comfy.utils.ProgressBar(batch_size)
+
+        # 计算RTX内部尺寸
+        orig_h, orig_w = image.shape[1], image.shape[2]
+        if target_w >= orig_w and target_h >= orig_h:
+            rtx_w, rtx_h = target_w, target_h
+        else:
+            rtx_w = max(target_w, orig_w * 2)
+            rtx_h = max(target_h, orig_h * 2)
+        rtx_w = max(8, round(rtx_w / 8) * 8)
+        rtx_h = max(8, round(rtx_h / 8) * 8)
+
+        quality_mapping = {
+            "ULTRA": nvvfx.effects.QualityLevel.ULTRA,
+            "HIGH": nvvfx.effects.QualityLevel.HIGH,
+            "MEDIUM": nvvfx.effects.QualityLevel.MEDIUM,
+            "LOW": nvvfx.effects.QualityLevel.LOW,
+        }
+
+        upscaled_chunks = []
+        processed = 0
+
+        # 单次创建RTX context，复用处理所有帧
+        with nvvfx.VideoSuperRes(quality_mapping["ULTRA"]) as sr:
+            sr.output_width = rtx_w
+            sr.output_height = rtx_h
+            sr.load()
+
+            for i in range(0, batch_size, chunk_size):
+                batch = image[i:i + chunk_size]
+                # BHWC -> BCHW, 移到GPU
+                batch_cuda = batch.permute(0, 3, 1, 2).cuda().contiguous()
+
+                chunk_outputs = []
+                for j in range(batch_cuda.shape[0]):
+                    dlpack_out = sr.run(batch_cuda[j]).image
+                    rtx_output = torch.from_dlpack(dlpack_out).clone()
+                    # CHW -> HWC
+                    chunk_outputs.append(rtx_output.permute(1, 2, 0).cpu())
+                    processed += 1
+                    pbar.update_absolute(processed, batch_size)
+
+                chunk_tensor = torch.stack(chunk_outputs, dim=0)
+
+                # 如果RTX输出尺寸与目标不同，用lanczos缩小
+                if rtx_w != target_w or rtx_h != target_h:
+                    # 用GPU批量lanczos缩小
+                    chunk_tensor = self._resize_torch_batch(chunk_tensor, target_w, target_h, "bicubic")
+
+                upscaled_chunks.append(chunk_tensor)
+
+        return torch.cat(upscaled_chunks, dim=0)
 
 
 NODE_CLASS_MAPPINGS.update({
@@ -3094,11 +3169,1331 @@ class KeywordFilterLoRA:
         return (matched_keywords, model_lora, clip_lora, status)
 
 
+class OutpaintingPreprocess:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "expand_top": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "expand_bottom": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "expand_left": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "expand_right": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+                "fill_color": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFF, "step": 1}),
+                "auto_color": ("BOOLEAN", {"default": False}),
+                "auto_color_sample": ("INT", {"default": 5, "min": 1, "max": 64, "step": 1}),
+                "feather_radius": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING")
+    RETURN_NAMES = ("image", "mask", "expand_params")
+    FUNCTION = "expand_image"
+    CATEGORY = "image"
+
+    def expand_image(self, image, expand_top, expand_bottom, expand_left, expand_right, fill_color, auto_color, auto_color_sample, feather_radius):
+        batch = image.shape[0]
+        h, w = image.shape[1], image.shape[2]
+
+        # 计算各方向扩展像素
+        top_px = int(h * expand_top)
+        bottom_px = int(h * expand_bottom)
+        left_px = int(w * expand_left)
+        right_px = int(w * expand_right)
+
+        new_h = h + top_px + bottom_px
+        new_w = w + left_px + right_px
+
+        # 原图在画布中的位置
+        ox, oy = left_px, top_px
+
+        results_img = []
+        results_mask = []
+
+        for bi in range(batch):
+            img_np = (image[bi].cpu().numpy() * 255).astype(np.uint8)
+
+            # 创建原图图层: 用 BORDER_REPLICATE 将边缘像素延伸到扩展区域，避免黑色
+            canvas_orig = cv2.copyMakeBorder(
+                img_np, top_px, bottom_px, left_px, right_px, cv2.BORDER_REPLICATE
+            ).astype(np.float32)
+
+            # 创建填充画布，并向原图区域延伸填充色，避免 alpha 过渡时出现黑色
+            if auto_color:
+                sample = auto_color_sample
+                top_color = img_np[:sample, :, :].mean(axis=(0, 1)) if top_px > 0 else None
+                bottom_color = img_np[-sample:, :, :].mean(axis=(0, 1)) if bottom_px > 0 else None
+                left_color = img_np[:, :sample, :].mean(axis=(0, 1)) if left_px > 0 else None
+                right_color = img_np[:, -sample:, :].mean(axis=(0, 1)) if right_px > 0 else None
+
+                canvas_fill = np.zeros((new_h, new_w, 3), dtype=np.float32)
+
+                # 填充各方向扩展区域
+                if top_px > 0:
+                    canvas_fill[:oy, :] = top_color
+                if bottom_px > 0:
+                    canvas_fill[oy + h:, :] = bottom_color
+                if left_px > 0:
+                    canvas_fill[:, :ox] = left_color
+                if right_px > 0:
+                    canvas_fill[:, ox + w:] = right_color
+
+                # 填充四角: 两边颜色的平均值
+                if top_px > 0 and left_px > 0:
+                    canvas_fill[:oy, :ox] = (top_color + left_color) / 2.0
+                if top_px > 0 and right_px > 0:
+                    canvas_fill[:oy, ox + w:] = (top_color + right_color) / 2.0
+                if bottom_px > 0 and left_px > 0:
+                    canvas_fill[oy + h:, :ox] = (bottom_color + left_color) / 2.0
+                if bottom_px > 0 and right_px > 0:
+                    canvas_fill[oy + h:, ox + w:] = (bottom_color + right_color) / 2.0
+
+                # 向原图区域延伸各方向的填充色
+                if top_px > 0:
+                    canvas_fill[oy:oy + h, ox:ox + w] = top_color
+                if bottom_px > 0:
+                    canvas_fill[oy:oy + h, ox:ox + w] = bottom_color
+                if left_px > 0:
+                    canvas_fill[oy:oy + h, ox:ox + w] = left_color
+                if right_px > 0:
+                    canvas_fill[oy:oy + h, ox:ox + w] = right_color
+                # 多方向时原图区域取所有方向平均
+                active_colors = [c for c in [top_color, bottom_color, left_color, right_color] if c is not None]
+                if len(active_colors) > 1:
+                    canvas_fill[oy:oy + h, ox:ox + w] = np.mean(active_colors, axis=0)
+
+                # 四角到直边的颜色过渡羽化
+                if feather_radius > 0:
+                    canvas_blur = cv2.GaussianBlur(canvas_fill, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+                    corner_mask = np.zeros((new_h, new_w), dtype=bool)
+                    if top_px > 0:
+                        corner_mask[:oy, :] = True
+                    if bottom_px > 0:
+                        corner_mask[oy + h:, :] = True
+                    feather_band = feather_radius
+                    if left_px > 0:
+                        bl = max(0, ox - feather_band)
+                        br = min(ox + feather_band, new_w)
+                        if top_px > 0:
+                            corner_mask[:oy, bl:br] = True
+                        if bottom_px > 0:
+                            corner_mask[oy + h:, bl:br] = True
+                    if right_px > 0:
+                        bl = max(0, ox + w - feather_band)
+                        br = min(ox + w + feather_band, new_w)
+                        if top_px > 0:
+                            corner_mask[:oy, bl:br] = True
+                        if bottom_px > 0:
+                            corner_mask[oy + h:, bl:br] = True
+                    if top_px > 0:
+                        bt = max(0, oy - feather_band)
+                        bb = min(oy + feather_band, new_h)
+                        if left_px > 0:
+                            corner_mask[bt:bb, :ox] = True
+                        if right_px > 0:
+                            corner_mask[bt:bb, ox + w:] = True
+                    if bottom_px > 0:
+                        bt = max(0, oy + h - feather_band)
+                        bb = min(oy + h + feather_band, new_h)
+                        if left_px > 0:
+                            corner_mask[bt:bb, :ox] = True
+                        if right_px > 0:
+                            corner_mask[bt:bb, ox + w:] = True
+                    canvas_fill[corner_mask] = canvas_blur[corner_mask]
+            else:
+                r = (fill_color >> 16) & 0xFF
+                g = (fill_color >> 8) & 0xFF
+                b = fill_color & 0xFF
+                canvas_fill = np.full((new_h, new_w, 3), [r, g, b], dtype=np.float32)
+
+            # 创建混合 alpha: 1.0=原图, 0.0=填充
+            alpha = np.zeros((new_h, new_w), dtype=np.float32)
+            alpha[oy:oy + h, ox:ox + w] = 1.0
+
+            # 羽化 alpha: 边界处互相渐变
+            if feather_radius > 0:
+                alpha = cv2.GaussianBlur(alpha, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+
+            # 混合: 原图 * alpha + 填充 * (1 - alpha)
+            alpha_3d = alpha[:, :, np.newaxis]
+            canvas = canvas_orig * alpha_3d + canvas_fill * (1.0 - alpha_3d)
+            canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+
+            # 创建 mask 输出: 1.0=扩展区域, 0.0=原图区域
+            mask = np.zeros((new_h, new_w), dtype=np.float32)
+            if top_px > 0:
+                mask[:oy, :] = 1.0
+            if bottom_px > 0:
+                mask[oy + h:, :] = 1.0
+            if left_px > 0:
+                mask[:, :ox] = 1.0
+            if right_px > 0:
+                mask[:, ox + w:] = 1.0
+
+            # mask 羽化: 仅内接边缘羽化，外框边缘不羽化
+            if feather_radius > 0:
+                blurred = cv2.GaussianBlur(mask, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+                border_fix = np.zeros_like(mask, dtype=bool)
+                if top_px > 0:
+                    border_fix[:min(feather_radius, top_px), :] = True
+                if bottom_px > 0:
+                    border_fix[max(0, new_h - feather_radius):, :] = True
+                if left_px > 0:
+                    border_fix[:, :min(feather_radius, left_px)] = True
+                if right_px > 0:
+                    border_fix[:, max(0, new_w - feather_radius):] = True
+                outer_edge = border_fix & (mask == 1.0)
+                blurred[outer_edge] = 1.0
+                mask = blurred
+
+            results_img.append(torch.from_numpy(canvas.astype(np.float32) / 255.0).unsqueeze(0))
+            results_mask.append(torch.from_numpy(mask).unsqueeze(0))
+
+        out_img = torch.cat(results_img, dim=0)
+        out_mask = torch.cat(results_mask, dim=0)
+
+        expand_params = f"{w},{h},{expand_top},{expand_bottom},{expand_left},{expand_right}"
+
+        return (out_img, out_mask, expand_params)
+
+
+class OutpaintingRemove:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "expand_params": ("STRING", {"default": "", "forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "remove_outpainting"
+    CATEGORY = "image"
+
+    def remove_outpainting(self, image, expand_params):
+        # 解析参数: 原始w,原始h,expand_top,expand_bottom,expand_left,expand_right
+        parts = expand_params.split(",")
+        orig_w, orig_h = int(parts[0]), int(parts[1])
+        e_top, e_bottom = float(parts[2]), float(parts[3])
+        e_left, e_right = float(parts[4]), float(parts[5])
+
+        batch = image.shape[0]
+        cur_h, cur_w = image.shape[1], image.shape[2]
+
+        # 原始扩图后的总尺寸
+        expanded_w = orig_w * (1 + e_left + e_right)
+        expanded_h = orig_h * (1 + e_top + e_bottom)
+
+        # 按比例计算原图在当前图像中的位置
+        left_px = int(e_left / (1 + e_left + e_right) * cur_w)
+        top_px = int(e_top / (1 + e_top + e_bottom) * cur_h)
+        right_px = cur_w - int(e_right / (1 + e_left + e_right) * cur_w)
+        bottom_px = cur_h - int(e_bottom / (1 + e_top + e_bottom) * cur_h)
+
+        # 确保边界合法
+        left_px = max(0, left_px)
+        top_px = max(0, top_px)
+        right_px = min(cur_w, right_px)
+        bottom_px = min(cur_h, bottom_px)
+
+        results = []
+        for i in range(batch):
+            cropped = image[i, top_px:bottom_px, left_px:right_px, :]
+            results.append(cropped.unsqueeze(0))
+
+        return (torch.cat(results, dim=0),)
+
+
+class KeywordReverseFilter:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "multiline": True}),
+                "keywords": ("STRING", {"default": "", "multiline": True, "placeholder": "每行一个关键词"}),
+                "output_text": ("STRING", {"default": "", "multiline": True, "placeholder": "不匹配时输出的文本"}),
+                "case_sensitive": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("result", "status")
+    FUNCTION = "reverse_filter"
+    CATEGORY = "text"
+
+    def reverse_filter(self, text, keywords, output_text, case_sensitive):
+        keyword_list = [kw.strip() for kw in keywords.split('\n') if kw.strip()]
+
+        if not keyword_list:
+            return ("", "No keywords specified")
+
+        search_text = text if case_sensitive else text.lower()
+
+        for kw in keyword_list:
+            kw_search = kw if case_sensitive else kw.lower()
+            if kw_search in search_text:
+                return ("", f"Matched: {kw}")
+
+        return (output_text, "No match, output text sent")
+
+
+class DarkRegionOverlay:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image_a": ("IMAGE",),
+                "image_b": ("IMAGE",),
+                "brightness_threshold": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "overlay_color": ("INT", {"default": 0xFFFFFF, "min": 0, "max": 0xFFFFFF, "step": 1}),
+                "feather_radius": ("INT", {"default": 5, "min": 0, "max": 256, "step": 1}),
+                "dilate_pixels": ("INT", {"default": 0, "min": 0, "max": 512, "step": 1}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+    FUNCTION = "overlay_dark_regions"
+    CATEGORY = "image"
+
+    def overlay_dark_regions(self, image_a, image_b, brightness_threshold, overlay_color, feather_radius, dilate_pixels):
+        batch_a = image_a.shape[0]
+        h_a, w_a = image_a.shape[1], image_a.shape[2]
+
+        # 解析覆盖色
+        r = (overlay_color >> 16) & 0xFF
+        g = (overlay_color >> 8) & 0xFF
+        b = overlay_color & 0xFF
+
+        results_img = []
+        results_mask = []
+
+        for i in range(batch_a):
+            img_a = (image_a[i].cpu().numpy() * 255).astype(np.float32)
+
+            # 取 B 图对应帧，若 batch 不够则循环
+            idx_b = i % image_b.shape[0]
+            img_b = (image_b[idx_b].cpu().numpy() * 255).astype(np.float32)
+
+            # 将 B 图 resize 到 A 图尺寸
+            if img_b.shape[0] != h_a or img_b.shape[1] != w_a:
+                img_b_pil = Image.fromarray(img_b.astype(np.uint8))
+                img_b_pil = img_b_pil.resize((w_a, h_a), Image.LANCZOS)
+                img_b = np.array(img_b_pil).astype(np.float32)
+
+            # 计算 B 图亮度
+            brightness = img_b.mean(axis=2) / 255.0
+
+            # 暗区蒙版: 亮度低于阈值的区域为 1.0
+            mask = np.zeros((h_a, w_a), dtype=np.float32)
+            mask[brightness < brightness_threshold] = 1.0
+
+            # 蒙版扩张
+            if dilate_pixels > 0:
+                kernel = np.ones((dilate_pixels * 2 + 1, dilate_pixels * 2 + 1), dtype=np.uint8)
+                mask_uint8 = (mask * 255).astype(np.uint8)
+                mask_uint8 = cv2.dilate(mask_uint8, kernel, iterations=1)
+                mask = mask_uint8.astype(np.float32) / 255.0
+
+            # 羽化蒙版
+            if feather_radius > 0:
+                mask = cv2.GaussianBlur(mask, (feather_radius * 2 + 1, feather_radius * 2 + 1), 0)
+
+            # 用蒙版覆盖 A 图: result = A * (1-mask) + color * mask
+            mask_3d = mask[:, :, np.newaxis]
+            overlay = np.full_like(img_a, [r, g, b], dtype=np.float32)
+            result = img_a * (1.0 - mask_3d) + overlay * mask_3d
+            result = np.clip(result, 0, 255).astype(np.uint8)
+
+            results_img.append(torch.from_numpy(result.astype(np.float32) / 255.0).unsqueeze(0))
+            results_mask.append(torch.from_numpy(mask).unsqueeze(0))
+
+        out_img = torch.cat(results_img, dim=0)
+        out_mask = torch.cat(results_mask, dim=0)
+
+        return (out_img, out_mask)
+
+
+class DanbooruFetcher:
+    """Fetch tags and image from a Danbooru post URL (supports images, videos, gifs, etc.)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "url": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "tag_separator": ("STRING", {"default": ", ", "multiline": False}),
+                "replace_underscores": ("BOOLEAN", {"default": True}),
+                "exclude_general": ("BOOLEAN", {"default": False}),
+                "exclude_meta": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("image", "all_tags", "copyright_tags", "character_tags", "artist_tags", "general_tags", "meta_tags")
+    FUNCTION = "fetch"
+    CATEGORY = "Text"
+    OUTPUT_NODE = True
+
+    @staticmethod
+    def _fetch_json(api_url):
+        """Fetch JSON from Danbooru API. Tries curl first (bypasses Cloudflare), then requests."""
+        import subprocess
+        import json
+
+        # Method 1: curl (bypasses Cloudflare bot detection)
+        try:
+            result = subprocess.run(
+                ["curl", "-s", "-H", "Accept: application/json", api_url],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and result.stdout.strip().startswith("{"):
+                return json.loads(result.stdout)
+        except Exception:
+            pass
+
+        # Method 2: requests
+        import requests
+        try:
+            resp = requests.get(api_url, headers={"Accept": "application/json"}, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            pass
+
+        # Method 3: cloudscraper
+        try:
+            import cloudscraper
+            scraper = cloudscraper.create_scraper()
+            resp = scraper.get(api_url, timeout=15)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _download_file(url, timeout=30):
+        """Download a file from URL, return bytes. Tries curl then requests."""
+        import subprocess
+        # curl
+        try:
+            result = subprocess.run(
+                ["curl", "-s", url],
+                capture_output=True, timeout=timeout,
+            )
+            if result.returncode == 0 and len(result.stdout) > 100:
+                return result.stdout
+        except Exception:
+            pass
+        # requests
+        import requests
+        try:
+            resp = requests.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _image_to_tensor(img):
+        """Convert a PIL Image (RGB) to ComfyUI IMAGE tensor."""
+        return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).unsqueeze(0)
+
+    def _fetch_image(self, data):
+        """Download the post image. For videos, extract first frame via cv2."""
+        import tempfile
+        import io
+
+        file_ext = data.get("file_ext", "").lower()
+        file_url = data.get("file_url", "")
+
+        if not file_url:
+            return None
+
+        raw = self._download_file(file_url)
+        if not raw:
+            return None
+
+        image_exts = {"jpg", "jpeg", "png", "webp"}
+        video_exts = {"mp4", "webm", "avi", "mkv", "gif"}
+
+        if file_ext in image_exts:
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            return self._image_to_tensor(img)
+
+        if file_ext in video_exts:
+            tmp = tempfile.NamedTemporaryFile(suffix=f".{file_ext}", delete=False)
+            try:
+                tmp.write(raw)
+                tmp.close()
+                if file_ext == "gif":
+                    img = Image.open(tmp.name).convert("RGB")
+                    return self._image_to_tensor(img)
+                else:
+                    cap = cv2.VideoCapture(tmp.name)
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret:
+                        img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                        return self._image_to_tensor(img)
+            finally:
+                os.unlink(tmp.name)
+
+        return None
+
+    def fetch(self, url, tag_separator=", ", replace_underscores=True, exclude_general=False, exclude_meta=False):
+        import re
+
+        empty_strings = ("", "", "", "", "", "")
+        empty_black = (torch.zeros(1, 64, 64, 3, dtype=torch.float32),) + empty_strings
+
+        if not url or "danbooru.donmai.us" not in url:
+            return empty_black
+
+        match = re.search(r'/posts/(\d+)', url)
+        if not match:
+            return empty_black
+
+        post_id = match.group(1)
+        api_url = f"https://danbooru.donmai.us/posts/{post_id}.json"
+
+        data = self._fetch_json(api_url)
+        if not data:
+            return empty_black
+
+        # Image
+        image_tensor = self._fetch_image(data)
+        if image_tensor is None:
+            image_tensor = torch.zeros(1, 64, 64, 3, dtype=torch.float32)
+
+        # Tags
+        def clean_tag(s):
+            tags = s.split()
+            if replace_underscores:
+                tags = [t.replace("_", " ") for t in tags]
+            return tag_separator.join(tags)
+
+        tag_copyright = clean_tag(data.get("tag_string_copyright", ""))
+        tag_character = clean_tag(data.get("tag_string_character", ""))
+        tag_artist = clean_tag(data.get("tag_string_artist", ""))
+        tag_general = clean_tag(data.get("tag_string_general", ""))
+        tag_meta = clean_tag(data.get("tag_string_meta", ""))
+
+        parts = []
+        if tag_copyright:
+            parts.append(tag_copyright)
+        if tag_character:
+            parts.append(tag_character)
+        if tag_artist:
+            parts.append(tag_artist)
+        if tag_general and not exclude_general:
+            parts.append(tag_general)
+        if tag_meta and not exclude_meta:
+            parts.append(tag_meta)
+        all_tags = tag_separator.join(parts)
+
+        return (image_tensor, all_tags, tag_copyright, tag_character, tag_artist, tag_general, tag_meta)
+
+
 NODE_CLASS_MAPPINGS.update({
-    "KeywordFilterLoRA": KeywordFilterLoRA,
+    "DanbooruFetcher": DanbooruFetcher,
 })
 
 NODE_DISPLAY_NAME_MAPPINGS.update({
-    "KeywordFilterLoRA": "🏷️ Keyword Filter + LoRA"
+    "DanbooruFetcher": "🏷️ Danbooru Fetcher",
 })
+
+
+NODE_CLASS_MAPPINGS.update({
+    "KeywordFilterLoRA": KeywordFilterLoRA,
+    "OutpaintingPreprocess": OutpaintingPreprocess,
+    "OutpaintingRemove": OutpaintingRemove,
+    "KeywordReverseFilter": KeywordReverseFilter,
+    "DarkRegionOverlay": DarkRegionOverlay,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "KeywordFilterLoRA": "🏷️ Keyword Filter + LoRA",
+    "OutpaintingPreprocess": "🖼️ Outpainting Preprocess",
+    "OutpaintingRemove": "🖼️ Outpainting Remove",
+    "KeywordReverseFilter": "🏷️ Keyword Reverse Filter",
+    "DarkRegionOverlay": "🖼️ Dark Region Overlay",
+})
+
+
+# Text File Line Reader
+class TextFileLineReader:
+    """Read a txt file and output a specific line by index. Index updates after each run based on mode."""
+
+    _index_state = {}  # abs_path -> current_index (persists across runs)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "file_path": ("STRING", {"default": "", "multiline": False}),
+                "index": ("INT", {"default": 0, "min": 0, "max": 1000000}),
+                "mode": (["fix", "increment", "decrement", "random"],),
+                "reset": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "INT")
+    RETURN_NAMES = ("text", "current_index")
+    FUNCTION = "read_line"
+    CATEGORY = "Text"
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(cls, file_path, index, mode, reset):
+        # Force re-execution every time so increment/decrement/random state updates
+        return time.time()
+
+    def read_line(self, file_path, index, mode, reset):
+        import random
+
+        if not file_path or not os.path.isfile(file_path):
+            return ("", index)
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            lines = [line.rstrip("\n") for line in f.readlines()]
+
+        if not lines:
+            return ("", index)
+
+        total = len(lines)
+        abs_path = os.path.abspath(file_path)
+
+        # Determine current index
+        if reset or mode == "fix":
+            current_index = index
+        else:
+            current_index = self._index_state.get(abs_path, index)
+
+        # Clamp to valid range
+        current_index = max(0, min(current_index, total - 1))
+        text = lines[current_index]
+
+        # Update state for next run
+        if mode == "increment":
+            self._index_state[abs_path] = (current_index + 1) % total
+        elif mode == "decrement":
+            self._index_state[abs_path] = (current_index - 1) % total
+        elif mode == "random":
+            self._index_state[abs_path] = random.randint(0, total - 1)
+
+        return (text, current_index)
+
+
+NODE_CLASS_MAPPINGS.update({
+    "TextFileLineReader": TextFileLineReader,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "TextFileLineReader": "📄 Text File Line Reader",
+})
+
+
+# ============================================================================
+# Prompt Enhance (OpenAI-compatible) —— 设置节点 + 提示词增强节点
+# 配置记录保存在插件目录下的 prompt_enhance_endpoints.json
+# ============================================================================
+
+# 配置记录文件路径（与 ray_nodes.py 同目录）
+PROMPT_ENHANCE_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt_enhance_endpoints.json")
+
+
+def _load_prompt_enhance_records():
+    """读取 JSON 配置记录；文件不存在或损坏时返回空 dict。"""
+    if not os.path.isfile(PROMPT_ENHANCE_JSON):
+        return {}
+    try:
+        with open(PROMPT_ENHANCE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_prompt_enhance_records(records):
+    """写入 JSON 配置记录（UTF-8、缩进、保留中文可读）。"""
+    try:
+        with open(PROMPT_ENHANCE_JSON, "w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _join_openai_path(base_url, path):
+    """拼接 OpenAI 兼容路径。
+
+    若 base_url 已带版本段（/v1、/v2、/v3 等）则直接拼接，
+    否则补上 /v1（兼容 OpenAI 及大部分第三方网关，如豆包 /api/coding/v3 已带版本段则保留）。
+    """
+    url = (base_url or "").rstrip("/")
+    if re.search(r"/v\d+$", url):
+        return f"{url}/{path}"
+    return f"{url}/v1/{path}"
+
+
+def _extract_content(data):
+    """从 OpenAI 兼容响应里取文本内容。
+
+    兼容思考型模型（如 Gemini 2.5/3 Pro、DeepSeek-R 系）：当 message.content 为空时，
+    回退读取 reasoning_content，否则会拿到空字符串导致节点输出空白。
+    """
+    try:
+        msg = data["choices"][0]["message"]
+    except Exception:
+        return ""
+    content = (msg.get("content") or "").strip()
+    if content:
+        return content
+    # 回退：思考型模型可能把所有输出放在 reasoning_content 里
+    return (msg.get("reasoning_content") or "").strip()
+
+
+def _test_endpoint_connectivity(base_url, api_key, model_id="", timeout=15):
+    """测试 OpenAI 兼容端点连通性：GET {base_url}/models。
+
+    返回 (ok: bool, message: str)。
+    """
+    import requests
+
+    # 若 base_url 已带版本段（/v1、/v2、/v3 ...）则直接拼接，
+    # 否则补上 /v1（兼容 OpenAI 及大部分第三方网关）。
+    models_url = _join_openai_path(base_url, "models")
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        resp = requests.get(models_url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            return True, "Connected (200 OK)"
+        # 401/403 一般代表 key 问题，但端点本身可达
+        return False, f"HTTP {resp.status_code}: {resp.text[:120]}"
+    except requests.exceptions.Timeout:
+        return False, "Timeout"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Connection error: {e}"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+
+class PromptEnhanceSettings:
+    """提示词扩写 —— 端点设置节点。
+
+    输入名称、URL、API Key、默认模型；运行时测试连通性并写入 JSON 记录。
+    force_save 开关允许测试失败也追加/更新记录。
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "name": ("STRING", {"default": "", "placeholder": "记录名称（同名即更新）"}),
+                "base_url": ("STRING", {"default": "https://api.openai.com/v1", "placeholder": "OpenAI 兼容端点，如 https://api.openai.com/v1"}),
+                "api_key": ("STRING", {"default": "", "placeholder": "sk-..."}),
+                "model_id": ("STRING", {"default": "", "placeholder": "默认模型 id，如 gpt-4o-mini"}),
+                "force_save": ("BOOLEAN", {"default": False, "label_on": "测试失败也保存", "label_off": "仅测试成功保存"}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("status",)
+    FUNCTION = "apply"
+    CATEGORY = "text"
+    OUTPUT_NODE = True
+
+    def apply(self, name, base_url, api_key, model_id, force_save):
+        name = (name or "").strip()
+        base_url = (base_url or "").strip()
+        api_key = api_key or ""
+        model_id = (model_id or "").strip()
+
+        if not name:
+            return ("❌ 记录名称不能为空",)
+
+        records = _load_prompt_enhance_records()
+        ok, msg = _test_endpoint_connectivity(base_url, api_key, model_id)
+
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        records[name] = {
+            "url": base_url,
+            "api_key": api_key,
+            "model_id": model_id,
+            "status": f"{'OK' if ok else 'FAIL'}: {msg}",
+            "last_tested": now,
+        }
+
+        if ok or force_save:
+            _save_prompt_enhance_records(records)
+            if ok:
+                status = f"✅ 连通成功，已保存记录「{name}」({msg})"
+            else:
+                status = f"⚠️ 连通失败，但已保存记录「{name}」（force_save）\n原因：{msg}"
+        else:
+            status = f"❌ 连通失败，未保存记录「{name}」\n原因：{msg}\n（如需强制保存，请打开 force_save 开关）"
+
+        return (status,)
+
+
+class PromptEnhancer:
+    """提示词扩写 —— 增强节点。
+
+    从 JSON 记录中选择一个端点，输入模型 id、系统提示词、用户提示词，
+    以 OpenAI 标准 chat/completions 格式请求并返回扩写结果。
+    支持内置预设模板（画面要素位置 / 细节要素 / 风格 / 光照），
+    并通过 seed 实现确定性：输入与 seed 未变时复用缓存，避免重复请求 LLM。
+    """
+
+    # 内置预设提示词模板。每个模板的 system_prompt 覆盖
+    # 「画面要素位置 / 细节要素 / 风格 / 光照」四个维度。
+    # 选 "(不使用预设)" 时使用用户自定义的 system_prompt。
+    PRESETS = {
+        "(不使用预设)": {
+            "system_prompt": "",
+            "description": "完全使用下方自定义系统提示词",
+        },
+        "🎨 通用扩写（推荐）": {
+            "system_prompt": (
+                "你是一位专业的 AI 绘画提示词工程师。请把用户给出的原始提示词扩写为一段高质量的英文画面描述，"
+                "严格按以下四个维度组织，且每个维度都不可遗漏：\n"
+                "\n"
+                "1. 画面要素位置 (composition & layout)：主体在画面中的位置、构图方式（如居中/三分构图/仰视）、"
+                "镜头（如特写/全身/广角）、画面景别、前景/背景层次。\n"
+                "2. 细节要素 (details)：人物/物体的具体特征——五官、表情、发色发型、服饰、配饰、材质纹理、"
+                "动作姿态，以及环境中的道具与背景物体。\n"
+                "3. 风格 (style)：画风/艺术流派（如写实/二次元/油画/赛博朋克）、画家或作品参考、"
+                "色彩倾向（冷暖/高饱和/低饱和）、渲染质感。\n"
+                "4. 光照 (lighting)：光源类型（自然光/逆光/侧光/体积光）、光质（硬光/柔光）、"
+                "阴影方向与对比、氛围色调。\n"
+                "\n"
+                "要求：\n"
+                "- 只输出最终的英文提示词（danbooru 风格标签或自然语言均可，保持与原文一致的风格），不要解释。\n"
+                "- 保留用户原文的核心语义与关键标签，只做增补，不删改原意。\n"
+                "- 输出为逗号分隔的英文短语，长度适中，避免冗长重复。"
+            ),
+            "description": "覆盖四个维度，输出逗号分隔英文标签",
+        },
+        "🧸 二次元角色 (Anime Character)": {
+            "system_prompt": (
+                "你是二次元插画提示词扩写专家。把用户的原始提示词扩写为英文标签序列，覆盖以下四维度：\n"
+                "1. 画面要素位置：人物在画面的位置与构图（如 1girl, upper body, cowboy shot, from above）、"
+                "镜头景别。\n"
+                "2. 细节要素：角色五官/瞳色/发色发型/表情/服装/配饰/姿态/动作，使用 danbooru 标签。\n"
+                "3. 风格：画风（如 anime, illustration, masterpiece, best quality）、参考画师、色彩倾向。\n"
+                "4. 光照：光源与氛围（如 soft lighting, backlighting, rim light, dramatic lighting）。\n"
+                "要求：输出逗号分隔英文 danbooru 标签；保留原文核心标签；不解释、不输出多余文字。"
+            ),
+            "description": "二次元角色向，danbooru 标签风格",
+        },
+        "📷 写实摄影 (Photorealistic)": {
+            "system_prompt": (
+                "你是写实摄影提示词扩写专家。把用户的原始提示词扩写为一段英文自然语言描述，覆盖：\n"
+                "1. 画面要素位置：主体位置、构图（rule of thirds, centered, leading lines）、焦段（如 85mm, wide angle）、"
+                "景深与背景。\n"
+                "2. 细节要素：主体的具体细节、皮肤质感、服饰材质、环境道具。\n"
+                "3. 风格：照片类型与相机参考（如 DSLR, 35mm film, Fujifilm, bokeh, sharp focus, 8k, ultra detailed）。\n"
+                "4. 光照：光线（golden hour, soft window light, studio lighting, volumetric light）、阴影与对比度。\n"
+                "要求：输出一段连贯的英文描述，保留原文核心语义，不解释。"
+            ),
+            "description": "写实摄影向，自然语言描述",
+        },
+        "🌅 场景概念 (Scene Concept)": {
+            "system_prompt": (
+                "你是场景概念设计提示词扩写专家。把用户的原始场景提示词扩写为英文描述，覆盖四维度：\n"
+                "1. 画面要素位置：场景构图、视角（eye-level, bird's eye view）、前景/中景/远景层次、画面纵深。\n"
+                "2. 细节要素：建筑/自然物体的结构、材质、植被、天气、点缀元素与人物（如有）。\n"
+                "3. 风格：概念艺术风格（concept art, matte painting, epic, detailed）、参考画师、色彩方案。\n"
+                "4. 光照：时间与天气光线（dawn, dusk, overcast, dramatic sky, god rays）、氛围。\n"
+                "要求：输出英文描述，保留原文核心语义，不解释。"
+            ),
+            "description": "场景概念设计向",
+        },
+    }
+
+    @classmethod
+    def get_preset_names(cls):
+        return list(cls.PRESETS.keys())
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "endpoint": (cls.get_endpoints(),),
+                "preset": (cls.get_preset_names(), {"default": "🎨 通用扩写（推荐）"}),
+                "model_id": ("STRING", {"default": "", "placeholder": "留空则使用记录中的默认模型"}),
+                "system_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": "系统提示词（选了预设则叠加在预设之后；选\"不使用预设\"则单独生效）"}),
+                "user_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": "需要扩写的原始提示词"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            },
+            "optional": {
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768, "step": 1}),
+            },
+        }
+
+    @classmethod
+    def get_endpoints(cls):
+        """动态下拉选项：读取 JSON 记录名；无记录时给兜底项避免加载失败。"""
+        records = _load_prompt_enhance_records()
+        names = list(records.keys())
+        if not names:
+            return ["(无记录，请先用设置节点添加)"]
+        return names
+
+    @classmethod
+    def IS_CHANGED(cls, endpoint, preset, model_id, system_prompt, user_prompt, seed, **kwargs):
+        # 确定性缓存键：端点记录内容 + 预设 + 模型 + 系统提示词 + 用户提示词 + seed。
+        # 这些都未变时返回同一值 → ComfyUI 复用上次结果，跳过对 LLM 的重复请求。
+        records = _load_prompt_enhance_records()
+        rec_blob = json.dumps(records.get(endpoint, {}), ensure_ascii=False, sort_keys=True)
+        key = "|".join([
+            rec_blob,
+            str(preset),
+            str(model_id or ""),
+            str(system_prompt or ""),
+            str(user_prompt or ""),
+            str(seed),
+            str(kwargs.get("temperature", 0.7)),
+            str(kwargs.get("max_tokens", 1024)),
+        ])
+        # 用稳定的 hash 作为缓存指纹（hexdigest 避免负数/平台差异）
+        import hashlib
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("enhanced_text", "status")
+    FUNCTION = "enhance"
+    CATEGORY = "text"
+
+    def enhance(self, endpoint, preset, model_id, system_prompt, user_prompt, seed, temperature=0.7, max_tokens=1024):
+        import requests
+
+        records = _load_prompt_enhance_records()
+        if endpoint not in records:
+            return ("", f"❌ 找不到记录「{endpoint}」，请先用设置节点添加")
+
+        rec = records[endpoint]
+        base_url = rec.get("url", "").strip()
+        api_key = rec.get("api_key", "")
+        use_model = (model_id or rec.get("model_id", "")).strip()
+
+        if not use_model:
+            return ("", "❌ 未指定模型 id（请填写 model_id 或在记录中设置默认模型）")
+
+        if not base_url:
+            return ("", f"❌ 记录「{endpoint}」缺少 url")
+
+        # 合成最终系统提示词：预设模板在前，用户自定义在后（若都有则拼接）
+        preset_sp = self.PRESETS.get(preset, {}).get("system_prompt", "")
+        custom_sp = (system_prompt or "").strip()
+        if preset_sp and custom_sp:
+            effective_sp = preset_sp + "\n\n" + custom_sp
+        else:
+            effective_sp = preset_sp or custom_sp
+
+        # 拼接 chat/completions 端点（已带 /vN 则保留，否则补 /v1）
+        chat_url = _join_openai_path(base_url, "chat/completions")
+
+        messages = []
+        if effective_sp:
+            messages.append({"role": "system", "content": effective_sp})
+        # 把 seed 注入到用户消息前，使相同文本但不同 seed 也能触发新请求
+        messages.append({"role": "user", "content": f"[seed={seed}]\n{user_prompt}"})
+
+        payload = {
+            "model": use_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            resp = requests.post(chat_url, headers=headers, json=payload, timeout=120)
+        except requests.exceptions.Timeout:
+            return ("", "❌ 请求超时")
+        except Exception as e:
+            return ("", f"❌ 请求异常：{e}")
+
+        if resp.status_code != 200:
+            return ("", f"❌ HTTP {resp.status_code}: {resp.text[:300]}")
+
+        try:
+            data = resp.json()
+            content = _extract_content(data)
+        except Exception as e:
+            return ("", f"❌ 解析响应失败：{e}\n原始：{resp.text[:300]}")
+
+        usage = data.get("usage", {})
+        preset_tag = preset if preset != "(不使用预设)" else "自定义"
+        status = (f"✅ 成功 | 端点: {endpoint} | 模型: {use_model} | 预设: {preset_tag} | "
+                  f"seed: {seed} | tokens: {usage.get('total_tokens', '?')}")
+        return (content, status)
+
+
+def _image_to_data_url(image_tensor, quality=85, max_side=1024):
+    """把单张 ComfyUI IMAGE 张量编码为 OpenAI Vision 用的 data URL。
+
+    输入兼容 [H,W,C] 或 [1,H,W,C]（float 0-1），内部统一压成 [H,W,C]。
+    - JPEG 压缩减少 token 消耗（Vision API 按图计费/计 token）
+    - 长边缩放到 max_side，避免超大图超时
+    """
+    import base64
+    from io import BytesIO
+
+    arr = (255.0 * image_tensor.cpu().numpy()).clip(0, 255).astype(np.uint8)
+    # 兜底：去掉可能的 batch 维度，确保 PIL 拿到的是 [H,W,C]
+    if arr.ndim == 4:
+        arr = arr[0]
+    img = Image.fromarray(arr)
+    # 长边等比缩小
+    if max_side and max(img.size) > max_side:
+        ratio = max_side / max(img.size)
+        img = img.resize((int(img.size[0] * ratio), int(img.size[1] * ratio)), Image.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _hash_image_tensor(image_tensor):
+    """对单张图像张量算稳定指纹，用于缓存键。"""
+    import hashlib
+    arr = (255.0 * image_tensor.cpu().numpy()).clip(0, 255).astype(np.uint8)
+    if arr.ndim == 4:
+        arr = arr[0]
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+class ImageAnalyzer:
+    """图片分析节点（OpenAI Vision 兼容）。
+
+    复用提示词扩写的 endpoint 记录，输入图像，输出按
+    「画面要素 / 构图 / 光影 / 风格」描述的图片描述。
+    内置预设系统提示词；seed 控制确定性（输入与 seed 未变则复用缓存）。
+    """
+
+    # 内置预设：按 画面要素 / 构图 / 光影 / 风格 描述图片
+    PRESETS = {
+        "(不使用预设)": {
+            "system_prompt": "",
+            "description": "完全使用下方自定义系统提示词",
+        },
+        "🔎 通用描述（推荐）": {
+            "system_prompt": (
+                "你是一位专业的图像描述专家。请仔细观察用户提供的图片，"
+                "用英文输出一段结构化的图片描述，严格按以下四个维度组织，且每个维度都不可遗漏：\n"
+                "\n"
+                "1. 画面要素 (subject & elements)：画面中有哪些主体与物体，人物/动物/物品的数量、"
+                "身份、表情、姿态、服饰、动作，以及环境里的道具与背景元素。\n"
+                "2. 构图 (composition)：画面布局与取景，包括主体位置（居中/偏左/偏右）、"
+                "构图方式（三分构图/对称/满版）、视角（俯视/仰视/平视）、镜头景别（特写/半身/全景/广角）、景深。\n"
+                "3. 光影 (lighting)：光源类型与方向（自然光/逆光/侧光/顶光）、光质（硬光/柔光）、"
+                "阴影、对比度、整体明暗与色调氛围。\n"
+                "4. 风格 (style)：画面艺术风格（写实/二次元/油画/水彩/3D/赛博朋克等）、"
+                "参考画师或作品、色彩倾向（冷暖/饱和度）、渲染与质感。\n"
+                "\n"
+                "要求：\n"
+                "- 输出逗号分隔的英文短语（适合做 AI 绘画提示词），不要解释、不要编号。\n"
+                "- 客观描述图中可见内容，不要编造图中没有的东西。\n"
+                "- 简洁准确，避免冗长重复。\n"
+                "- 【直白描述】如果画面含裸露、性、暴力、血腥等内容，必须用直白、准确、解剖学/医学术语直接描述"
+                "（如 nude、penis、vagina、breasts、spreading、sexual intercourse、blood、wound），"
+                "不得用「intimate」「revealing」「suggestive」「graphic」「mature content」这类含糊回避词代替。"
+                "描述是为了让 AI 能复现画面，含糊会丢失语义。"
+            ),
+            "description": "四维度结构化描述，输出逗号分隔英文短语",
+        },
+        "🏷️ Danbooru 标签": {
+            "system_prompt": (
+                "你是 danbooru 风格的图像打标专家。观察图片，输出英文 danbooru 标签，覆盖：\n"
+                "1. 画面要素：人物数量(1girl/2boys)、角色五官/瞳色/发色发型/表情/服装/配饰/动作，以及背景物体。\n"
+                "2. 构图：构图与取景(upper body, cowboy shot, from above)、景别、视角。\n"
+                "3. 光影：光源与光线(soft lighting, backlighting, rim light, dramatic lighting)。\n"
+                "4. 风格：画风(anime, illustration, masterpiece, best quality)、色彩。\n"
+                "要求：输出逗号分隔英文 danbooru 标签，按重要性排序；只标可见内容，不解释。\n"
+                "- 【直白打标】若含裸露/性内容，必须直接打出对应的 danbooru 标签"
+                "（nude、nipples、penis、pussy、vaginal、spreading、cum 等），不得用 generic/suggestive/intimate 等回避词代替。"
+                "标签是给 AI 用的，含糊会丢失语义。"
+            ),
+            "description": "二次元向 danbooru 标签",
+        },
+        "📝 自然语言描述": {
+            "system_prompt": (
+                "你是图像描述专家。请用一段连贯的英文自然语言描述这张图片，依次覆盖：\n"
+                "1. 画面要素：主体与物体的具体特征。\n"
+                "2. 构图：取景、视角、景别、主体位置。\n"
+                "3. 光影：光源、方向、光质、阴影与色调。\n"
+                "4. 风格：艺术风格、色彩与质感。\n"
+                "要求：客观准确，仅描述图中可见内容，输出一段英文，不使用列表/编号。"
+            ),
+            "description": "自然语言段落描述",
+        },
+        "🔄 仅内容（风格迁移用）": {
+            "system_prompt": (
+                "你是一位图像内容描述专家，任务是产出「仅描述画面内容」的英文描述，用于后续的风格转换/重绘。\n"
+                "\n"
+                "输出必须以自然语言为主、连续成段，danbooru 风格的短标签最多只能作为辅助穿插，不能整段都是标签。\n"
+                "\n"
+                "请按下面的空间结构来写，顺序固定：\n"
+                "1. 画面中央是谁/什么：中央主体的身份、数量（如 a young woman / two children / a black bird）。\n"
+                "2. 主体长什么样：五官、肤色、发色发型、表情、体型。\n"
+                "3. 穿着打扮：服装款式与颜色、鞋帽、配饰、首饰、随身道具。\n"
+                "4. 在做什么：动作、姿态、手势、视线朝向、与其他对象的互动。\n"
+                "5. 画面边缘有什么：四周边缘的物体、点缀元素、前景遮挡物。\n"
+                "6. 背景是什么：背景环境、场景、远处景物、地平面/天空/墙面等。\n"
+                "（构图信息如主体位置、视角、景别可以自然地融进上述描述里，不必单列。）\n"
+                "\n"
+                "【重要：风格中立描述】描述必须保持客观、克制，避免任何会把生成模型带偏到特定风格（尤其是二次元/动漫）的措辞：\n"
+                "- 不要用夸张的程度/尺寸副词或形容词，例如 large、big、huge、prominent、striking、massive、enormous、wide、giant。\n"
+                "  （错误：large blue eyes, prominent blush；正确：blue eyes, a flush on her cheeks）\n"
+                "- 只描述客观颜色与位置，不描述程度：五官/表情直接写事实（has blue eyes, freckles across the nose），"
+                "不要加 large/sparkling/exaggerated/prominent 之类修饰。\n"
+                "- 不要用动漫化的情绪组合词（如 sparkling eyes、teary-eyed smile、blushing smile），"
+                "改成中性事实描述（tears at the corners of her eyes, a flush on the cheeks）。\n"
+                "- 描述特征时用「事实」而非「印象」：写「a flush on her cheeks」而不是「a prominent blush」；"
+                "写「wavy black hair reaching her shoulders」而不是「long flowing black hair」。\n"
+                "\n"
+                "【严格禁止】以下内容绝对不能出现在输出中（这些要留给重绘时的目标风格自由发挥）：\n"
+                "- 任何光影相关：光源、光照、光质、阴影、明暗、对比度、氛围光、golden hour、lighting 等词汇。\n"
+                "- 任何风格相关：写实/照片/插画/二次元/油画/水彩/3D/赛博朋克/画师名/作品名等，"
+                "以及 masterpiece、best quality、render、photorealistic、illustration 等画质/风格标签。\n"
+                "- 任何画质/相机/胶片相关：8k、ultra detailed、DSLR、film、bokeh、sharp focus 等。\n"
+                "\n"
+                "要求：\n"
+                "- 用英文写成一段连贯的自然语言，按上面 1→6 的顺序；可用少量括号标签辅助，但以句子为主。\n"
+                "- 客观描述图中可见的内容，不编造图中没有的东西。\n"
+                "- 检查并删除任何夸张修饰词（large/prominent 等）和任何光影或风格词。\n"
+                "- 【直白描述】若画面含裸露、性、暴力、血腥等内容，必须用直白、准确、解剖学术语直接描述"
+                "（如 nude、bare breasts、penis、vulva、spreading legs、vaginal penetration、blood、open wound），"
+                "不得用「intimate」「revealing」「suggestive」「graphic」「explicit」等含糊回避词代替。"
+                "这是给风格迁移用的内容描述，含糊会丢失语义导致无法复现。"
+            ),
+            "description": "自然语言为主的画面内容描述（中央主体→外观→服装→动作→边缘→背景），剥离光影与风格，供风格转换/重绘使用",
+        },
+        "📷 强制真实化（一律描述成照片）": {
+            "system_prompt": (
+                "你是一位写实摄影图像描述专家。无论原图是什么风格（写实照片、二次元插画、油画、3D、概念图等），"
+                "你都必须把它描述成一张真实拍摄的照片——假设这就是一张抓拍/摆拍的真实现场照片，用写实的摄影语言描述。\n"
+                "\n"
+                "输出以自然语言为主、连续成段，danbooru 风格的短标签最多只能作为辅助穿插。\n"
+                "\n"
+                "【核心规则：一切虚构特征都当成真实存在的物理道具/妆容/造型】\n"
+                "- 动物耳/兽耳 → 描述成真实的 cosplay 头饰、毛绒发箍或头戴配件（如 'a pair of pointed fuzzy headbands resembling animal ears'）。\n"
+                "- 光环/悬浮物 → 描述成真实的道具，如悬挂/支撑的圆环、LED 光环道具、头饰配件（如 'a pink ring-shaped prop suspended above her head'）。\n"
+                "- 不可能的发色（蓝/粉/紫/红/绿等） → 描述成染色头发（'color-dyed hair'），并补 'visible hair dye, dyed strands'。\n"
+                "- 不可能的瞳色（红/紫等） → 描述成彩色美瞳（'colored contact lenses'）。\n"
+                "- 魔法/特效/发光 → 描述成真实的灯光/烟雾/反光（如舞台灯、烟雾机、玻璃反光）。\n"
+                "- 虚构生物/科幻元素 → 描述成 cosplay 服装、特效化妆、道具或布景。\n"
+                "\n"
+                "【必须使用写实摄影语言】描述人物和场景时强制带上这些照片语料里的特征：\n"
+                "- 皮肤：natural skin texture\n"
+                "- 面部：asymmetrical facial features, fine lines, realistic facial proportions\n"
+                "- 材质：fabric weave texture, stitching, scuffs and wear on props\n"
+                "- 摄影：captured on a camera, candid, in-camera, raw photograph\n"
+                "（把上述合适的特征自然融进描述里，不要简单堆砌）\n"
+                "\n"
+                "【严格禁止】任何会把生成模型带回绘画/动漫的词：\n"
+                "- 禁止：illustration、anime、manga、painting、oil painting、watercolor、concept art、"
+                "cel shading、3d render、cgi、vector art、digital art、fanart\n"
+                "- 禁止：masterpiece、best quality、highly detailed（这类是绘画/动漫区的画质标签）\n"
+                "- 禁止描述成「画风」：不要说 'the style of...'、'reminiscent of...画师'。\n"
+                "\n"
+                "请按这个顺序组织描述：\n"
+                "1. 中央主体是谁/什么（按真实人/物来写）。\n"
+                "2. 外观：五官（按真人写）、肤色、发色（按染发写）、体型、皮肤质感。\n"
+                "3. 穿着与道具：服装、鞋帽、配饰，以及所有虚构特征对应的真实道具/妆造。\n"
+                "4. 动作/姿态。\n"
+                "5. 画面边缘与前景。\n"
+                "6. 背景环境。\n"
+                "\n"
+                "要求：用英文写成一段连贯的自然语言，客观描述图中内容（把虚构特征如实转译为真实道具），"
+                "确保整段读起来像在描述一张真实照片。\n"
+                "- 【直白描述】若画面含裸露、性、暴力、血腥等内容，按真实人体/真实事件直白描述"
+                "（如 nude、bare breasts、penis、vulva、spreading、penetration、blood、wound），"
+                "不得用 intimate、revealing、suggestive、graphic、explicit 等含糊回避词代替。"
+                "照片描述必须准确，含糊会丢失语义。"
+            ),
+            "description": "无论原图什么风格，一律描述成真实照片（虚构特征转译为道具/染发/美瞳，并强制写实皮肤/摄影语言）",
+        },
+    }
+
+    @classmethod
+    def get_preset_names(cls):
+        return list(cls.PRESETS.keys())
+
+    @classmethod
+    def get_endpoints(cls):
+        """与 PromptEnhancer 共用同一份 endpoint 记录。"""
+        records = _load_prompt_enhance_records()
+        names = list(records.keys())
+        if not names:
+            return ["(无记录，请先用设置节点添加)"]
+        return names
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "endpoint": (cls.get_endpoints(),),
+                "preset": (cls.get_preset_names(), {"default": "🔎 通用描述（推荐）"}),
+                "model_id": ("STRING", {"default": "", "placeholder": "留空则使用记录中的默认模型（需为支持视觉的模型）"}),
+                "system_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": "系统提示词（选了预设则叠加在预设之后；选\"不使用预设\"则单独生效）"}),
+                "extra_prompt": ("STRING", {"default": "", "multiline": True, "placeholder": "附加用户指令（可选，如\"重点描述人物服装\"）"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            },
+            "optional": {
+                "temperature": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
+                "max_tokens": ("INT", {"default": 1024, "min": 1, "max": 32768, "step": 1}),
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, image, endpoint, preset, model_id, system_prompt, extra_prompt, seed, **kwargs):
+        # 确定性缓存键：图像内容指纹 + 端点记录 + 预设 + 提示词 + seed。
+        # 全部未变 → 复用上次结果，跳过重复的 Vision 请求。
+        import hashlib
+        records = _load_prompt_enhance_records()
+        rec_blob = json.dumps(records.get(endpoint, {}), ensure_ascii=False, sort_keys=True)
+        # batch：把每张图的指纹串起来
+        if image is not None and hasattr(image, "shape") and image.dim() >= 4:
+            img_hashes = ",".join(_hash_image_tensor(image[i]) for i in range(image.shape[0]))
+        else:
+            img_hashes = "no_image"
+        key = "|".join([
+            img_hashes,
+            rec_blob,
+            str(preset),
+            str(model_id or ""),
+            str(system_prompt or ""),
+            str(extra_prompt or ""),
+            str(seed),
+            str(kwargs.get("temperature", 0.5)),
+            str(kwargs.get("max_tokens", 1024)),
+        ])
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    RETURN_TYPES = ("STRING", "STRING")
+    RETURN_NAMES = ("description", "status")
+    FUNCTION = "analyze"
+    CATEGORY = "text"
+
+    def analyze(self, image, endpoint, preset, model_id, system_prompt, extra_prompt, seed, temperature=0.5, max_tokens=1024):
+        import requests
+
+        if image is None:
+            return ("", "❌ 未输入图像")
+
+        records = _load_prompt_enhance_records()
+        if endpoint not in records:
+            return ("", f"❌ 找不到记录「{endpoint}」，请先用设置节点添加")
+
+        rec = records[endpoint]
+        base_url = rec.get("url", "").strip()
+        api_key = rec.get("api_key", "")
+        use_model = (model_id or rec.get("model_id", "")).strip()
+
+        if not use_model:
+            return ("", "❌ 未指定模型 id（请填写支持视觉的模型，如 gpt-4o / doubao-vision）")
+        if not base_url:
+            return ("", f"❌ 记录「{endpoint}」缺少 url")
+
+        # 合成最终系统提示词：预设在前，自定义在后
+        preset_sp = self.PRESETS.get(preset, {}).get("system_prompt", "")
+        custom_sp = (system_prompt or "").strip()
+        if preset_sp and custom_sp:
+            effective_sp = preset_sp + "\n\n" + custom_sp
+        else:
+            effective_sp = preset_sp or custom_sp
+
+        chat_url = _join_openai_path(base_url, "chat/completions")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # 处理 batch：N 张图分别描述
+        n = image.shape[0] if hasattr(image, "shape") and image.dim() >= 4 else 1
+        descriptions = []
+        total_tokens = 0
+        for i in range(n):
+            # 统一取单张 [H,W,C]；_image_to_data_url 内部对 4D 也有兜底
+            img_tensor = image[i] if hasattr(image, "shape") and image.dim() >= 4 else image
+            data_url = _image_to_data_url(img_tensor)
+
+            # OpenAI Vision 标准格式：content 为多模态块数组
+            content = [
+                {"type": "text", "text": (f"[seed={seed}] " + (extra_prompt + " " if extra_prompt else "")).strip()},
+                {"type": "image_url", "image_url": {"url": data_url}},
+            ]
+            messages = []
+            if effective_sp:
+                messages.append({"role": "system", "content": effective_sp})
+            messages.append({"role": "user", "content": content})
+
+            payload = {
+                "model": use_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+
+            try:
+                resp = requests.post(chat_url, headers=headers, json=payload, timeout=120)
+            except requests.exceptions.Timeout:
+                return ("", f"❌ 第 {i+1}/{n} 张图请求超时")
+            except Exception as e:
+                return ("", f"❌ 第 {i+1}/{n} 张图请求异常：{e}")
+
+            if resp.status_code != 200:
+                return ("", f"❌ 第 {i+1}/{n} 张图 HTTP {resp.status_code}: {resp.text[:300]}")
+
+            try:
+                data = resp.json()
+                content_text = _extract_content(data)
+            except Exception as e:
+                return ("", f"❌ 第 {i+1}/{n} 张图解析响应失败：{e}\n原始：{resp.text[:300]}")
+
+            descriptions.append(content_text)
+            total_tokens += data.get("usage", {}).get("total_tokens", 0)
+
+        # 多张图用分隔符分开；单张直接输出
+        if n > 1:
+            description = "\n\n---\n\n".join(descriptions)
+        else:
+            description = descriptions[0] if descriptions else ""
+
+        preset_tag = preset if preset != "(不使用预设)" else "自定义"
+        status = (f"✅ 成功 | 端点: {endpoint} | 模型: {use_model} | 预设: {preset_tag} | "
+                  f"图片数: {n} | seed: {seed} | tokens: {total_tokens}")
+        return (description, status)
+
+
+NODE_CLASS_MAPPINGS.update({
+    "PromptEnhanceSettings": PromptEnhanceSettings,
+    "PromptEnhancer": PromptEnhancer,
+    "ImageAnalyzer": ImageAnalyzer,
+})
+
+NODE_DISPLAY_NAME_MAPPINGS.update({
+    "PromptEnhanceSettings": "🤖 提示词扩写设置 (Prompt Enhance Settings)",
+    "PromptEnhancer": "🤖 提示词扩写 (Prompt Enhancer)",
+    "ImageAnalyzer": "🖼️ 图片分析 (Image Analyzer)",
+})
+
 
